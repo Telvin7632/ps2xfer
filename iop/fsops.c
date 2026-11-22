@@ -739,8 +739,10 @@ void fsops_task_expire(void)
 
 /* ---------------------------------------------------------------- verify read-ahead
  * The writer thread is idle while no write runs: it reads the next chunk of
- * a contiguous file from the disk (ATA DMA, the CPU sleeps) while the control
- * thread checksums the current one, so disk time hides behind CPU time. */
+ * a contiguous file while the control thread checksums the current one.
+ * Measured on hardware this overlaps little: ps2dev9 spins the CPU during
+ * the ATA DMA, so disk time and checksum time still mostly add up
+ * (verify ~18-19 MB/s; the unrolled Fletcher brought most of the gain). */
 static struct {
     const px_extent_t *e;
     u64 rel;
