@@ -161,6 +161,25 @@ void px_fletcher_update(px_fletcher_t *f, const void *buf, u32 len)
     const u32 *w = (const u32 *)buf;
     u32 n = len >> 2, s1 = f->s1, s2 = f->s2;
 
+    /* 8 words per turn, loads first: no load-delay stalls and 3.25 instead
+       of 5 instructions per word (verify on the IOP is bound by this loop) */
+    while (n >= 8) {
+        u32 a = w[0], b = w[1], c = w[2], d = w[3];
+        s1 += a; s2 += s1;
+        s1 += b; s2 += s1;
+        a = w[4];
+        b = w[5];
+        s1 += c; s2 += s1;
+        s1 += d; s2 += s1;
+        c = w[6];
+        d = w[7];
+        s1 += a; s2 += s1;
+        s1 += b; s2 += s1;
+        s1 += c; s2 += s1;
+        s1 += d; s2 += s1;
+        w += 8;
+        n -= 8;
+    }
     while (n--) {
         s1 += *w++;
         s2 += s1;

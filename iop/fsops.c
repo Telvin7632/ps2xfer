@@ -737,6 +737,98 @@ void fsops_task_expire(void)
     }
 }
 
+/* ---------------------------------------------------------------- verify read-ahead
+ * The writer thread is idle while no write runs: it reads the next chunk of
+ * a contiguous file from the disk (ATA DMA, the CPU sleeps) while the control
+ * thread checksums the current one, so disk time hides behind CPU time. */
+static struct {
+    const px_extent_t *e;
+    u64 rel;
+    void *buf;
+    u32 count;
+    volatile int pending;
+    int r;
+} g_ra;
+static int g_ra_done = -1;
+
+void fsops_readahead_service(void) /* writer thread */
+{
+    if (!g_ra.pending)
+        return;
+    g_ra.r       = px_extent_read(g_ra.e, g_ra.rel, g_ra.buf, g_ra.count);
+    g_ra.pending = 0;
+    plat_sem_signal(g_ra_done);
+}
+
+static void ra_start(const px_extent_t *e, u64 byte_off, void *buf, u32 bytes)
+{
+    g_ra.e       = e;
+    g_ra.rel     = byte_off >> 9;
+    g_ra.buf     = buf;
+    g_ra.count   = (bytes + 511) >> 9;
+    g_ra.pending = 1;
+    plat_sem_signal(g_writer_sem);
+}
+
+static int ra_wait(void)
+{
+    plat_sem_wait(g_ra_done);
+    return g_ra.r;
+}
+
+/* BLOCKSUMS of a contiguous file, double-buffered; returns blocks done or -PX_E* */
+static int blocksums_contig(FIL *f, const char *path, u64 off, u32 count, u8 *resp)
+{
+    px_extent_t e;
+    u64 fsize = f_size(f), end;
+    u32 ch, per_block, nch, k, blk = 0;
+    u8 *buf[2];
+    px_fletcher_t fl;
+
+    if (g_bufmem_size >= (1u << 20))
+        ch = 512u << 10;
+    else if (g_bufmem_size >= (512u << 10))
+        ch = 256u << 10;
+    else
+        return -PX_ENOTSUP;
+    if (count == 0 || (off & 511) || off >= fsize || file_extent(f, fsize, &e) != 0)
+        return -PX_ENOTSUP;
+    if (g_ra_done < 0 && (g_ra_done = plat_sem_create(0, 1)) < 0)
+        return -PX_ENOTSUP;
+    end = off + ((u64)count << 20);
+    if (end > fsize)
+        end = fsize;
+    per_block = (1u << 20) / ch;
+    nch       = (u32)((end - off + ch - 1) / ch);
+    buf[0]    = g_bufmem;
+    buf[1]    = g_bufmem + ch;
+
+    px_fletcher_init(&fl);
+    ra_start(&e, off, buf[0], (u32)(end - off < ch ? end - off : ch));
+    for (k = 0; k < nch; k++) {
+        u64 pos = off + (u64)k * ch;
+        u32 len = (u32)(end - pos < ch ? end - pos : ch);
+        u8 *b   = buf[k & 1];
+
+        if (ra_wait() != 0)
+            return -PX_EIO;
+        if (k + 1 < nch) {
+            u64 np = pos + ch;
+            ra_start(&e, np, buf[(k + 1) & 1], (u32)(end - np < ch ? end - np : ch));
+        }
+        if (len & 3)
+            memset(b + len, 0, 4 - (len & 3)); /* inside the buffer: len < ch here */
+        px_fletcher_update(&fl, b, (len + 3) & ~3u);
+        if ((k + 1) % per_block == 0 || k + 1 == nch) {
+            wr32(resp + 4 + blk * 4, px_fletcher_final(&fl));
+            blk++;
+            px_fletcher_init(&fl);
+            task_progress(PX_SF_VERIFY, path, fsize, pos + len);
+        }
+    }
+    return (int)blk;
+}
+
 int fsops_blocksums(const u8 *req, u32 len, u8 *resp, u32 *rlen)
 {
     char path[MAX_PATH];
@@ -760,8 +852,21 @@ int fsops_blocksums(const u8 *req, u32 len, u8 *resp, u32 *rlen)
 
     px_fs_lock();
     fr = f_open(&f, path, FA_READ);
-    if (fr == FR_OK)
-        fr = f_lseek(&f, off);
+    if (fr == FR_OK) {
+        int n = blocksums_contig(&f, path, off, count, resp);
+        if (n != -PX_ENOTSUP) {
+            f_close(&f);
+            px_fs_unlock();
+            if (n < 0)
+                return -n;
+            wr32(resp, (u32)n);
+            *rlen = 4 + (u32)n * 4;
+            return PX_OK;
+        }
+        if (off == 0)
+            px_log("verify %s: not contiguous, reading through FatFs\n", path);
+        fr = f_lseek(&f, off); /* fragmented (copied by another driver): read through FatFs */
+    }
     for (i = 0; fr == FR_OK && i < count; i++) {
         px_fletcher_t fl;
         u32 left = 1u << 20, got_total = 0;

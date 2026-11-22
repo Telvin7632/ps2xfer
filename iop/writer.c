@@ -87,6 +87,7 @@ void writer_thread(void *arg)
 
         g_stats.wr_phase = 1; /* waiting for a full slot */
         plat_sem_wait(g_writer_sem);
+        fsops_readahead_service(); /* verify read-ahead (only while no write runs) */
         while ((s = take_full_slot()) != NULL) {
             int err = 0;
 
