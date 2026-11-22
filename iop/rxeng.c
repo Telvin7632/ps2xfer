@@ -320,6 +320,6 @@ void rxeng_maybe_ack(int force)
             return;
     }
     len = rxeng_build_ack(buf);
-    plat_send(buf, len, NULL, 0);
+    plat_send_ack(buf, len);
     g_stats.acks_sent++;
 }

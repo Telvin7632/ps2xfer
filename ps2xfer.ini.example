@@ -24,3 +24,7 @@ port=7690
 # prof=0            1 = per-packet cycle profiling (shown by "ps2xfer.py bench ...")
 # state_mb=32       resume checkpoint interval, MiB
 # fs_iomanx=0       1 = bench mode: bdmfs_fatfs owns the disk (only "bench disk-iomanx" works)
+# Move the status screen if the TV cuts an edge. The D-pad does the same
+# live and shows the values to put here.
+# screen_x=0
+# screen_y=0

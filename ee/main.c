@@ -16,10 +16,12 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include <time.h>
 
 #include "px_stats.h"
 #include "proto.h"
+#include "ui.h"
 
 #define VERSION "0.1.0"
 
@@ -44,6 +46,10 @@ static char g_args[MAX_ARGS][48];
 static int g_nargs;
 static char g_cfg_src[64] = "defaults";
 static char g_exit_elf[128]; /* EE-only key: ELF to start on exit (e.g. ps2link) */
+static int g_screen_x, g_screen_y; /* EE-only keys: picture offset for the TV */
+static int g_gs_ok;                /* gsKit screen up (else the old text screen) */
+static char g_msg[96];             /* footer message */
+static int g_calib;                /* > 0: show the screen_x/y hint (in 250 ms ticks) */
 static int g_fs_iomanx;
 
 static void add_arg(const char *kv)
@@ -53,6 +59,14 @@ static void add_arg(const char *kv)
 
     if (kv[klen] != '=')
         return;
+    if (strncmp(kv, "screen_x=", 9) == 0) {
+        g_screen_x = atoi(kv + 9);
+        return;
+    }
+    if (strncmp(kv, "screen_y=", 9) == 0) {
+        g_screen_y = atoi(kv + 9);
+        return;
+    }
     if (strncmp(kv, "exit_elf=", 9) == 0) { /* not an IOP module argument */
         if (g_exit_elf[0] == 0) {
             strncpy(g_exit_elf, kv + 9, sizeof(g_exit_elf) - 1);
@@ -342,6 +356,17 @@ static void draw(float cur, float avg, int exit_hold)
     line(y++, exit_hold ? "  Keep holding START to exit..." : "  Hold START for 2 s to exit.");
 }
 
+/* new gsKit screen, or the old libdebug text screen if gsKit failed */
+static void render(float cur, float avg, int exit_hold)
+{
+    if (g_gs_ok) {
+        ui_draw(&g_st, g_cfg_src, cur, avg, g_msg, g_calib > 0);
+    } else {
+        draw(cur, avg, exit_hold);
+        line(22, "  %s", g_msg);
+    }
+}
+
 int main(int argc, char *argv[])
 {
     char argbuf[MAX_ARGS * 48];
@@ -388,9 +413,12 @@ int main(int argc, char *argv[])
     g_push_arg[0] = (u32)&g_push & 0x1fffffff;
     SifCallRpc(&g_rpc, PX_RPC_SET_PUSH, 0, g_push_arg, sizeof(g_push_arg), &g_st, sizeof(g_st), NULL, NULL);
 
-    scr_clear();
-    scr_setXY(0, 1);
-    scr_printf("  ps2xfer v" VERSION " - PC -> PS2 HDD (exFAT) over Ethernet");
+    g_gs_ok = (ui_init(g_screen_x, g_screen_y) == 0);
+    if (!g_gs_ok) {
+        scr_clear();
+        scr_setXY(0, 1);
+        scr_printf("  ps2xfer v" VERSION " - PC -> PS2 HDD (exFAT) over Ethernet");
+    }
     prev_t = clock();
     for (;;) {
         clock_t now;
@@ -434,13 +462,34 @@ int main(int argc, char *argv[])
 
         btn = pad_held();
         hold = (btn & PAD_START) ? hold + 1 : 0;
-        draw(cur, avg, hold > 0);
+        {
+            /* D-pad moves the picture (TV calibration); edge-triggered */
+            static u32 prev_btn;
+            u32 pressed = btn & ~prev_btn;
+            int dx = (pressed & PAD_RIGHT) ? 4 : (pressed & PAD_LEFT) ? -4 : 0;
+            int dy = (pressed & PAD_DOWN) ? 2 : (pressed & PAD_UP) ? -2 : 0;
+            prev_btn = btn;
+            if (g_gs_ok && (dx || dy)) {
+                ui_move(ui_off_x() + dx, ui_off_y() + dy);
+                g_calib = 40;
+            }
+        }
+        if (g_calib > 0)
+            g_calib--;
+        if (hold > 0 && hold < 8)
+            snprintf(g_msg, sizeof(g_msg), "Keep holding START to exit...");
+        else if (hold == 0 && strncmp(g_msg, "Keep", 4) == 0)
+            g_msg[0] = 0;
+        render(cur, avg, hold > 0);
         if (hold >= 8) { /* 8 x 250 ms */
-            line(22, "  Exiting: closing files...");
+            snprintf(g_msg, sizeof(g_msg), "Exiting: closing files...");
+            render(cur, avg, 0);
             rpc(PX_RPC_EXIT);
         }
         if (g_st.flags & PX_SF_EXIT) {
-            line(22, g_exit_elf[0] ? "  Bye. Starting the exit_elf program." : "  Bye. Returning to the browser.");
+            snprintf(g_msg, sizeof(g_msg), "%s", g_exit_elf[0] ? "Bye. Starting the exit_elf program."
+                                                               : "Bye. Returning to the browser.");
+            render(cur, avg, 0);
             {
                 clock_t t = clock();
                 while (clock() - t < CLOCKS_PER_SEC) {}
@@ -458,7 +507,9 @@ int main(int argc, char *argv[])
                 sbv_patch_disable_prefix_check();
                 rl = LoadELFFromFile(g_exit_elf, 0, NULL);
                 /* only reached on failure */
-                line(23, "  exit_elf %.40s failed: %d (MCMAN %d, MCSERV %d)", g_exit_elf, rl, r1, r2);
+                snprintf(g_msg, sizeof(g_msg), "exit_elf %.40s failed: %d (MCMAN %d, MCSERV %d)", g_exit_elf, rl,
+                         r1, r2);
+                render(cur, avg, 0);
                 {
                     clock_t t = clock();
                     while (clock() - t < 5 * CLOCKS_PER_SEC) {}

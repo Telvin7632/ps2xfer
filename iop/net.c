@@ -76,11 +76,40 @@ void net_init(u32 ip, u16 port)
     g_tx_sem  = CreateSema(&s);
 }
 
+static peer_t g_data_peer;
+static u32 build_udp_hdr(u8 *f, u32 payload_len);
+
 void plat_set_peer(const void *peer)
 {
     WaitSema(g_tx_sem);
     memcpy(&g_peer, peer, sizeof(g_peer));
     SignalSema(g_tx_sem);
+}
+
+void plat_set_data_peer(void)
+{
+    WaitSema(g_tx_sem);
+    g_data_peer = g_peer;
+    SignalSema(g_tx_sem);
+}
+
+/* ACK to the data peer (see plat.h) */
+int plat_send_ack(const void *buf, u32 len)
+{
+    peer_t save;
+    u32 n;
+
+    if (42 + len > sizeof(g_tx))
+        return -1;
+    WaitSema(g_tx_sem);
+    save   = g_peer;
+    g_peer = g_data_peer;
+    n = build_udp_hdr(g_tx, len);
+    memcpy(g_tx + n, buf, len);
+    smap_transmit(g_tx, (u16)(n + len), NULL, 0);
+    g_peer = save;
+    SignalSema(g_tx_sem);
+    return 0;
 }
 
 /* builds Ethernet + IPv4 + UDP headers for g_peer into f; returns 42 */
@@ -133,7 +162,12 @@ int plat_send_data(const void *hdr22, const void *data, u32 data_len)
     if (wl > 1472 - 22 || ((u32)data & 3))
         return -1;
     WaitSema(g_tx_sem);
-    build_udp_hdr(h, 22 + data_len);
+    {
+        peer_t save = g_peer;   /* READ_DATA goes to the data peer */
+        g_peer = g_data_peer;
+        build_udp_hdr(h, 22 + data_len);
+        g_peer = save;
+    }
     memcpy(h + 42, hdr22, 22);
     /* 64-byte header + payload: both 4-aligned, DMA'd straight to the TX FIFO */
     smap_transmit(h, 64, data, (u16)wl);
@@ -259,8 +293,8 @@ static int rx_cb(u16 len, const u8 *hdr, u16 hdr_len)
             if (plen < 8 || 34 + plen > len)
                 return 0;
             plen -= 8;
-            if (hdr[42] == PX_T_DATA)
-                return 0; /* DATA that missed the fast path (broadcast, short header) */
+            if (hdr[42] == PX_T_DATA || hdr[42] == PX_T_ANNOUNCE || (hdr[43] & PX_F_RESPONSE))
+                return 0; /* not a request for us */
 
             /* control: copy the UDP payload (from frame offset 40, so the copy
                stays 4-aligned) and hand it to the control thread */

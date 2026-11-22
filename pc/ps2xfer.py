@@ -693,6 +693,9 @@ def cmd_send(args):
     send_planned(c, args, files)
 
 
+OLD_NAME = None  # compiled lazily
+
+
 def is_opl_old_name(name: str) -> bool:
     """OPL's old ISO naming: SLUS_205.52.Name.iso (game ID taken from the name)."""
     import re
@@ -898,6 +901,159 @@ def cmd_art(args):
             total += len(got)
             print(f"  {gid} {n}: {', '.join(got) if got else 'nothing new'}")
     print(f"{total} art file(s) stored in /ART")
+
+
+class _Req:
+    __slots__ = ("off", "length", "buf", "got", "npk", "responded", "t", "parent", "pidx", "children")
+
+    def __init__(self, off, length, buf, parent=None, pidx=0):
+        self.off, self.length, self.buf = off, length, buf
+        self.npk = (length + PAYLOAD - 1) // PAYLOAD
+        self.got = set()
+        self.responded = False
+        self.t = 0.0
+        self.parent, self.pidx = parent, pidx   # single-packet re-request of parent's packet pidx
+        self.children = 0
+
+
+class Downloader:
+    """Reads a file from the PS2 with READ requests (several in flight). The
+    data arrives as READ_DATA packets; packets still missing after the
+    response are asked for again one by one; a request without any answer
+    for 1 s is sent again."""
+
+    def __init__(self, conn: Conn, path: str, sink, start: int = 0, size: int | None = None,
+                 inflight: int = 3, quiet: bool = False, label: str = ""):
+        self.c, self.path, self.sink = conn, path, sink
+        self.inflight, self.quiet, self.label = inflight, quiet, label
+        self.start, self.size = start, size
+        self.pending: dict[int, _Req] = {}     # req_id -> request on the wire
+        self.waiting: list[_Req] = []          # big requests waiting for their re-requests
+        self.next_off = start
+        self.done_upto = start
+        self.ready: dict[int, bytes] = {}      # finished chunks not yet in order
+        self.rerequests = 0
+        self.elapsed = 0.0
+
+    def _send(self, req: _Req):
+        rid = self.c._next_id()
+        body = struct.pack("<QI", req.off, req.length) + Conn.path(self.path)
+        self.c.sock.sendto(CTL.pack(T_READ, 0, 0, rid, self.c.session) + body, self.c.addr)
+        req.t = time.monotonic()
+        req.responded = False
+        self.pending[rid] = req
+
+    def _fill(self):
+        big = sum(1 for r in self.pending.values() if r.parent is None) + len(self.waiting)
+        while big < self.inflight and self.next_off < self.size:
+            big += 1
+            n = min(READ_MAX, self.size - self.next_off)
+            self._send(_Req(self.next_off, n, bytearray(n)))
+            self.next_off += n
+
+    def _finish(self, req: _Req):
+        if req.parent is not None:              # a re-request: count it in the parent
+            p = req.parent
+            p.got.update(range(req.pidx, req.pidx + req.npk))
+            p.children -= 1
+            if p.children == 0 and len(p.got) == p.npk:
+                self.waiting.remove(p)
+                self._finish(p)
+            return
+        self.ready[req.off] = bytes(req.buf)
+        while self.done_upto in self.ready:
+            b = self.ready.pop(self.done_upto)
+            self.sink(b)
+            self.done_upto += len(b)
+
+    def _on_data(self, rid, off, data):
+        req = self.pending.get(rid)
+        if req is None:
+            return
+        rel = off - req.off
+        if rel < 0 or rel + len(data) > req.length or rel % PAYLOAD:
+            return
+        req.buf[rel:rel + len(data)] = data
+        req.got.add(rel // PAYLOAD)
+        if len(req.got) == req.npk:
+            del self.pending[rid]
+            self._finish(req)
+
+    def _on_response(self, rid):
+        req = self.pending.get(rid)
+        if req is None:
+            return
+        req.responded = True
+        if len(req.got) == req.npk:
+            return
+        if req.parent is not None:
+            # a re-request lost some of its packets: ask for the same run again
+            del self.pending[rid]
+            req.got.clear()
+            self._send(req)
+            self.rerequests += 1
+            return
+        del self.pending[rid]
+        missing = [i for i in range(req.npk) if i not in req.got]
+        runs = []                                  # contiguous runs of missing packets
+        for i in missing:
+            if runs and runs[-1][1] == i:
+                runs[-1][1] = i + 1
+            else:
+                runs.append([i, i + 1])
+        req.children = len(runs)
+        self.waiting.append(req)
+        mv = memoryview(req.buf)
+        for a, b in runs:
+            o = a * PAYLOAD
+            n = min(b * PAYLOAD, req.length) - o
+            self._send(_Req(req.off + o, n, mv[o:o + n], parent=req, pidx=a))
+            self.rerequests += 1
+
+    def run(self) -> None:
+        if self.size is None:
+            st = self.c.call(T_STAT, Conn.path(self.path))
+            self.size = struct.unpack_from("<Q", st)[0]
+        t0 = time.perf_counter()
+        last_print = 0.0
+        self._fill()
+        while self.done_upto < self.size:
+            r, _, _ = select.select([self.c.sock], [], [], 0.05)
+            if r:
+                data, _ = self.c.sock.recvfrom(4096)
+                if len(data) >= DATA.size and data[0] == T_READ_DATA:
+                    _, fl, off, rid, _, _, n = DATA.unpack_from(data)
+                    self._on_data(rid, off, data[DATA.size:DATA.size + n])
+                elif len(data) >= CTL.size and data[0] == T_READ:
+                    t, fl, st, rid, sess = CTL.unpack_from(data)
+                    if fl & F_RESPONSE:
+                        if st != 0 and rid in self.pending:
+                            raise PxError(f"READ failed: {status_text(st)}")
+                        self._on_response(rid)
+            now = time.monotonic()
+            for rid in [k for k, v in self.pending.items() if now - v.t > 0.25]:
+                req = self.pending.pop(rid)
+                self._send(req)               # no answer at all: same range again
+                self.rerequests += 1
+            self._fill()
+            _check_cancel()
+            if not self.quiet and time.perf_counter() - last_print >= 0.5:
+                el = time.perf_counter() - t0
+                done = self.done_upto - self.start
+                rate = done / el if el > 0 else 0
+                eta = (self.size - self.done_upto) / rate if rate > 0 else 0
+                last_print = time.perf_counter()
+                if PROGRESS_HOOK is not None:
+                    PROGRESS_HOOK(self.label, self.done_upto, self.size, rate, rate, eta, self.rerequests)
+                    continue
+                sys.stdout.write(f"\r{self.label} {100 * self.done_upto / max(1, self.size):5.1f}%  "
+                                 f"{fmt_size(self.done_upto)}/{fmt_size(self.size)}  {rate / 1e6:5.2f} MB/s  "
+                                 f"ETA {int(eta) // 60}:{int(eta) % 60:02d}  re-requests {self.rerequests}")
+                sys.stdout.flush()
+                last_print = time.perf_counter()
+        self.elapsed = time.perf_counter() - t0
+        if not self.quiet:
+            sys.stdout.write("\n")
 
 
 def cmd_get(args):

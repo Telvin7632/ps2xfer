@@ -49,8 +49,12 @@ u64 plat_bd_sectors(void);                               /* 0 = no disk */
  *      `data` may be NULL; hdr and data are concatenated. */
 int plat_send(const void *hdr, u32 hdr_len, const void *data, u32 data_len);
 /* peer = sender of a control request (MAC, IP, UDP port), recorded by the RX
-   path; plat_send() always goes to the last peer set here. */
+   path. plat_send() answers the last request's sender; ACK and READ_DATA go
+   to the data peer, which only the session owner can set (a stray packet
+   from another host must not redirect the data stream). */
 #define PX_PEER_SIZE 12
+void plat_set_data_peer(void);   /* data peer = current request's sender */
+int plat_send_ack(const void *buf, u32 len);
 /* bulk send to the current peer: 22-byte protocol header + 4-aligned data
    (IOP: header and data go to the TX FIFO by DMA, data is not copied) */
 int plat_send_data(const void *hdr22, const void *data, u32 data_len);

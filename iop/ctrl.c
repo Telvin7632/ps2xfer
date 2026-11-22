@@ -197,12 +197,14 @@ static void dispatch(const u8 *req, u32 len)
     u32 olen = 0;
     int status = PX_OK;
 
-    if (req[1] & PX_F_RESPONSE)
-        return;
+    if ((req[1] & PX_F_RESPONSE) || type == PX_T_ANNOUNCE)
+        return; /* not for us: answers and other consoles' announcements */
     if (type != PX_T_HELLO && type != PX_T_PING && rd32(req + 8) != g_session) {
         send_resp(req, PX_ESESSION, 0);
         return;
     }
+    if (type != PX_T_PING)
+        plat_set_data_peer(); /* HELLO or a request of the current session */
     if (type != PX_T_HELLO && type != PX_T_PING && cached_resend(req))
         return;
 

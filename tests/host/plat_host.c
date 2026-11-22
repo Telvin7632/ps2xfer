@@ -26,6 +26,7 @@ int g_sock = -1;
 u32 g_host_maxfree = 1500 * 1024;
 u32 g_disk_mbps;  /* 0 = unlimited; otherwise simulated disk speed */
 static struct sockaddr_in g_peer;
+static struct sockaddr_in g_data_peer; /* ACK / READ_DATA destination */
 static pthread_mutex_t g_send_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 void plat_host_init(void)
@@ -162,9 +163,18 @@ double g_drop_tx_pct; /* loss injection for READ_DATA (host_main.c --drop-tx) */
 
 int plat_send_data(const void *hdr22, const void *data, u32 data_len)
 {
+    unsigned char buf[2048];
+
     if (g_drop_tx_pct > 0 && (double)rand() / RAND_MAX * 100.0 < g_drop_tx_pct)
         return 0;
-    return plat_send(hdr22, 22, data, data_len);
+    if (22 + data_len > sizeof(buf))
+        return -1;
+    memcpy(buf, hdr22, 22);
+    memcpy(buf + 22, data, data_len);
+    pthread_mutex_lock(&g_send_mutex);
+    sendto(g_sock, buf, 22 + data_len, 0, (struct sockaddr *)&g_data_peer, sizeof(g_data_peer));
+    pthread_mutex_unlock(&g_send_mutex);
+    return 0;
 }
 
 void plat_set_peer(const void *peer)
@@ -172,6 +182,22 @@ void plat_set_peer(const void *peer)
     pthread_mutex_lock(&g_send_mutex);
     memcpy(&g_peer, peer, sizeof(g_peer) < PX_PEER_SIZE ? sizeof(g_peer) : PX_PEER_SIZE);
     pthread_mutex_unlock(&g_send_mutex);
+}
+
+
+void plat_set_data_peer(void)
+{
+    pthread_mutex_lock(&g_send_mutex);
+    g_data_peer = g_peer;
+    pthread_mutex_unlock(&g_send_mutex);
+}
+
+int plat_send_ack(const void *buf, u32 len)
+{
+    pthread_mutex_lock(&g_send_mutex);
+    sendto(g_sock, buf, len, 0, (struct sockaddr *)&g_data_peer, sizeof(g_data_peer));
+    pthread_mutex_unlock(&g_send_mutex);
+    return 0;
 }
 
 u32 plat_idle_count(void) { return 0; }
