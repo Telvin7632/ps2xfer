@@ -12,10 +12,12 @@ device). The disk stays in the console.
 * `ps2xfer.py` is the PC client: one Python file, standard library only,
   for Windows, Linux and WSL.
 
-> **Status: Phase 1 (benchmark tooling).** It builds, and the protocol,
-> resume and file-system logic pass end-to-end tests against a host simulator.
-> It has **not been run on a real PS2 or in PCSX2 yet**. Expect bugs on real
-> hardware; please report what the screen and `ps2xfer.py log` show.
+> **Status:** works on a real console. Tested on a fat PS2 with a 320 GB
+> disk (exFAT, formatted on the console): **9.5 MB/s sustained** with no lost
+> packets (the IOP is the limit, see `docs/BENCHMARKS.md`), files of 4.5 GiB,
+> read-back verification, games booting from OPL 1.2.0-Beta-2271. Resume after
+> an interrupted transfer is tested in PCSX2 and in the host simulator
+> (`make test`), not yet by pulling the cable on a console.
 
 Every file is written as **one contiguous run** (exFAT "NoFatChain"),
 preallocated before the data arrives. That is the best case for OPL. During
