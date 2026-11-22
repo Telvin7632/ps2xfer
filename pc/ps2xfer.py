@@ -883,6 +883,105 @@ def cmd_opl_rename(args):
                 print(f"  {folder}/{n} -> {new}")
 
 
+# --------------------------------------------------------------- OPL art
+
+ART_DB = "https://archive.org/download/OPLM_ART_2024_09/OPLM_ART_2024_09.zip/PS2/{id}/{id}_{name}.{ext}"
+ART_COVERS = "https://raw.githubusercontent.com/xlenore/ps2-covers/main/covers/default/{dash}.jpg"
+# OPL file suffix -> name in the OPL Manager art backup
+ART_TYPES = {"COV": "COV", "COV2": "COV2", "ICO": "ICO", "LAB": "LAB", "LGO": "LGO",
+             "BG": "BG_00", "SCR": "SCR_00", "SCR2": "SCR_01"}
+
+
+def http_get(url: str, tries: int = 3) -> bytes | None:
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request(url, headers={"User-Agent": "ps2xfer"})
+    for i in range(tries):
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                return r.read()
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return None
+            time.sleep(2 * (i + 1))           # archive.org answers 503 when busy
+        except (urllib.error.URLError, TimeoutError, OSError):
+            time.sleep(2 * (i + 1))
+    return None
+
+
+def fetch_art(gid: str, kind: str) -> tuple[bytes, str] | None:
+    for ext in ("png", "jpg"):
+        data = http_get(ART_DB.format(id=gid, name=ART_TYPES[kind], ext=ext), tries=2 if ext == "jpg" else 3)
+        if data:
+            return data, ext
+    if kind == "COV":
+        data = http_get(ART_COVERS.format(dash=gid.replace("_", "-").replace(".", "")))
+        if data:
+            return data, "jpg"
+    return None
+
+
+def cmd_art(args):
+    """Downloads OPL art (covers, icons, spines, logos, backgrounds,
+    screenshots) for the games on the PS2 and stores it in /ART."""
+    import tempfile
+    c = connect(args)
+
+    def listdir(folder):
+        out, cursor = [], 0
+        while True:
+            try:
+                r = c.call(T_LIST, struct.pack("<I", cursor) + Conn.path(folder))
+            except PxError:
+                return out
+            nxt, count, _ = struct.unpack_from("<IHH", r)
+            pos = 8
+            for _ in range(count):
+                _, _, _, nl = struct.unpack_from("<QIBB", r, pos)
+                out.append(r[pos + 14:pos + 14 + nl].decode("utf-8", "replace"))
+                pos += 14 + nl
+            if nxt == 0:
+                return out
+            cursor = nxt
+
+    have = {n.rsplit(".", 1)[0] for n in listdir("/ART")}
+    games = []
+    for folder in ("/CD", "/DVD"):
+        for n in listdir(folder):
+            if not n.lower().endswith((".iso", ".zso")):
+                continue
+            gid = n[:11].upper() if is_opl_old_name(n) else (
+                remote_game_id(c, f"{folder}/{n}") if n.lower().endswith(".iso") else None)
+            if gid:
+                games.append((gid, n))
+            else:
+                print(f"  {n}: no game ID, skipped")
+    tmpdir = tempfile.mkdtemp(prefix="ps2xfer-art-")
+    total = 0
+    try:
+        for gid, n in games:
+            got = []
+            for kind in ART_TYPES:
+                if f"{gid}_{kind}" in have and not args.overwrite:
+                    continue
+                r = fetch_art(gid, kind)
+                if r is None:
+                    continue
+                data, ext = r
+                tmp = os.path.join(tmpdir, f"{gid}_{kind}.{ext}")
+                with open(tmp, "wb") as f:
+                    f.write(data)
+                transfer(c, args, tmp, len(data), f"/ART/{gid}_{kind}.{ext}", OW_OVERWRITE,
+                         label=f"{gid}_{kind}")
+                got.append(kind)
+                total += 1
+            print(f"  {gid} {n}: {', '.join(got) if got else 'nothing new'}")
+    finally:
+        import shutil
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    print(f"{total} art file(s) stored in /ART")
+
+
 def cmd_get(args):
     c = connect(args)
     st = c.call(T_STAT, Conn.path(args.remote))
@@ -1457,6 +1556,10 @@ def main(argv=None):
     s.add_argument("remote")
     s.add_argument("--full", action="store_true", help="read the whole file back and compare SHA-256")
     s.set_defaults(func=cmd_verify)
+
+    s = sub.add_parser("art", help="download OPL art (covers, icons, backgrounds...) for the games on the PS2")
+    s.add_argument("--overwrite", action="store_true")
+    s.set_defaults(func=cmd_art)
 
     s = sub.add_parser("opl-rename", help="rename ISOs in /CD and /DVD to SLUS_xxx.xx.Name.iso")
     s.add_argument("--dry-run", action="store_true")

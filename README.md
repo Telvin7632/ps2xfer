@@ -58,6 +58,8 @@ python ps2xfer.py ls /DVD
 python ps2xfer.py df
 python ps2xfer.py rm /DVD/old.iso
 python ps2xfer.py mv /DVD/a.iso /DVD/b.iso
+python ps2xfer.py art                         # covers, icons, backgrounds... for OPL into /ART
+python ps2xfer.py opl-rename                  # SLUS_xxx.xx.Name.iso names (see below)
 python ps2xfer.py info | stats | log | ping | exit
 ```
 
@@ -71,6 +73,20 @@ python ps2xfer.py info | stats | log | ping | exit
 * If the disk has no contiguous free area large enough, the PS2 refuses the
   file ("no contiguous free space"). Free some space (or defragment the disk
   on a PC) and try again.
+
+### OPL and game names
+
+With OPL 1.2.0-Beta-2271 the owner's console lists ISOs on the internal HDD
+(BDM, exFAT) only with OPL's old naming `SLUS_205.52.Name.iso`; plain names
+(`Name.iso`) work from USB but not from the HDD (cause not found yet; files
+and disk check out). So `send` names `.iso` files that way by default (the
+game ID comes from SYSTEM.CNF inside the image; OPL shows the name without
+the ID). `--keep-name` disables it; `opl-rename` converts games already on
+the PS2.
+
+`art` downloads OPL artwork for every game on the PS2 from the OPL Manager
+art backup on archive.org (covers from xlenore/ps2-covers as a fallback) and
+stores it in `/ART`.
 
 ### Windows Explorer (FTP gateway)
 
