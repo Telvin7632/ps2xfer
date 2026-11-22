@@ -1,6 +1,17 @@
 # ps2xfer — design (Phase 0)
 
-Status: **approved by the owner 2026-11-21** (§15). Nothing below is implemented yet.
+Status: **approved by the owner 2026-11-21** (§15).
+
+Implementation status (Phase 1, 2026-11-22). Implemented: everything in §3–§8
+and §11–§14, except:
+* `--verify` uses the **blocks** mode (PS2 reads the file and computes a
+  word-Fletcher per 1 MiB; the PC compares). The **stream** mode (read-back to
+  the PC + SHA-256) is Phase 2;
+* on resume the client does not yet re-check the last 32 MiB with BLOCKSUMS
+  (§8.2). It trusts the durable watermark, which is written only after a disk
+  cache flush;
+* `prof_hdr` (header PIO time) is not measured separately; the profile gives
+  payload DMA and the whole RX path.
 
 Every statement is tagged as one of:
 

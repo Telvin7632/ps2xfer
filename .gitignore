@@ -1,0 +1,19 @@
+# build output
+*.o
+*.elf
+*.irx
+obj/
+ee/*_irx.c
+build.log
+dist/
+__pycache__/
+
+# host tests
+tests/host/build/
+
+# downloaded by tools/get_fatfs.sh
+iop/ff.c
+iop/ff.h
+iop/ffconf.h
+iop/diskio.h
+iop/ffunicode.c

@@ -1,0 +1,22 @@
+# ps2xfer.ini - put next to ps2xfer.elf (or at mc0:/PS2XFER/ps2xfer.ini).
+# Without it the IP comes from mc0:/SYS-CONF/IPCONFIG.DAT (wLaunchELF),
+# otherwise 192.168.0.10 is used.
+
+ip=192.168.0.10
+port=7690
+
+# ---- tuning (see docs/DESIGN.md and docs/BENCHMARKS.md); defaults shown
+# bufs=3            write buffers
+# buf_units=8       buffer size in units of 45056 bytes (8 = 352 KiB)
+# ata_chunk=0       sectors per ATA write command, 0 = whole buffer
+# csum=16           check the packet checksum on the IOP: 0 off, 1 all, N every N-th
+# ack_every=32      ACK every N packets
+# ack_ms=2          ... or after N ms
+# hdr_dma=0         1 = read packet headers by DMA instead of PIO
+# dma_block=128     RX payload DMA block: 64, 128, 512 or 0 (auto)
+# write_path=0      0 = raw writes into the preallocated file, 1 = FatFs f_write
+# pause=0           1 = advertise 802.3x PAUSE (flow control) on the link
+# rx_prio=10        SMAP thread priority
+# prof=0            1 = per-packet cycle profiling (shown by "ps2xfer.py bench ...")
+# state_mb=32       resume checkpoint interval, MiB
+# fs_iomanx=0       1 = bench mode: bdmfs_fatfs owns the disk (only "bench disk-iomanx" works)

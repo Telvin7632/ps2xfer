@@ -1,0 +1,54 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  ps2:
+    name: PS2 build (ps2dev/ps2dev:latest)
+    runs-on: ubuntu-latest
+    container: ps2dev/ps2dev:latest
+    defaults:
+      run:
+        shell: bash # GitHub runs it with -eo pipefail, so "make | tee" fails on errors
+    steps:
+      - name: Install build tools
+        shell: sh
+        run: apk add --no-cache build-base bash curl unzip git zip
+
+      - uses: actions/checkout@v5
+
+      - name: Build
+        run: make 2>&1 | tee build.log
+
+      - name: No compiler warnings
+        run: "! grep -i 'warning:' build.log"
+
+      - name: No unresolved symbols in the IRX
+        run: |
+          if mipsel-none-elf-nm iop/ps2xfer.notiopmod.elf | grep ' U '; then
+            echo "unresolved symbols in ps2xfer.irx"; exit 1
+          fi
+
+      - name: Release archive
+        run: make dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ps2xfer
+          path: dist/ps2xfer.zip
+          if-no-files-found: error
+
+  host-tests:
+    name: Simulator + client end-to-end tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install exfatprogs
+        run: sudo apt-get update && sudo apt-get install -y exfatprogs
+
+      - name: make test
+        run: make test
