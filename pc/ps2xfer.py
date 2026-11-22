@@ -304,6 +304,7 @@ class Sender:
         self.last_rate_up = time.monotonic()
         self.sent_win = 0
         self.lost_win = 0
+        self.credit_wait = 0.0   # seconds with nothing to send because of credit
         self.acks = 0
         self.buf = bytearray(DATA.size + PAYLOAD + 4)
         self.bufview = memoryview(self.buf)
@@ -458,7 +459,11 @@ class Sender:
                     self._poll_acks(0)
                 else:
                     next_t = now
+                    blocked = self.next_new < self.npkts and self.next_new * PAYLOAD >= self.credit
+                    t_w = time.perf_counter()
                     self._poll_acks(0.002)
+                    if blocked:
+                        self.credit_wait += time.perf_counter() - t_w
             else:
                 left = next_t - now
                 self._poll_acks(left - 0.0015 if left > 0.002 else 0)
@@ -534,6 +539,7 @@ def transfer(c: Conn, args, src_path: str | None, size: int, dest: str | None, f
         c.ack_handler = None
         src.close()
     return {"bytes": size - start, "seconds": s.elapsed, "retransmits": s.retransmits,
+            "credit_wait": s.credit_wait,
             "csum_errors": s.ps2_csum_errors, "rx_errors": s.ps2_rx_errors}
 
 
@@ -802,7 +808,8 @@ def cmd_bench(args):
         print(f"  {mbs:.2f} MB/s, {pps:.0f} pkt/s, retransmits {r['retransmits']}, "
               f"PS2: rx_errors +{s1['rx_errors'] - s0['rx_errors']}, overruns "
               f"+{s1['rx_overruns'] - s0['rx_overruns']}, drops +{s1['rx_drops'] - s0['rx_drops']}, "
-              f"csum errors +{s1['csum_errors'] - s0['csum_errors']}, CPU {s1['cpu_load_x10'] / 10:.1f}%")
+              f"csum errors +{s1['csum_errors'] - s0['csum_errors']}, CPU {s1['cpu_load_x10'] / 10:.1f}%, "
+              f"waiting for PS2 credit {100 * r['credit_wait'] / r['seconds']:.0f}% of the time")
         if s1["prof_smap_wakes"] > s0["prof_smap_wakes"]:
             npk = max(1, s1["rx_pkts"] - s0["rx_pkts"])
             d = {k: (s1[k] - s0[k]) & M32 for k in ("prof_smap16", "prof_smap_wakes", "prof_writer16",

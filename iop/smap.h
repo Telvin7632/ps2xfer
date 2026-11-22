@@ -55,12 +55,16 @@ int smap_init(unsigned int thread_priority, int enable_pause);
 int SMAPGetMACAddress(u8 *buffer);
 
 int smap_transmit(void *header, u16 headersize, const void *data, u16 datasize);
-/* cb runs on the SMAP thread for every good frame; hdr holds the first
-   hdr_len (<= 64) bytes. Return value is ignored (ps2xfer: the read pointer is
-   always moved to the end of the frame afterwards). */
+/* cb runs on the SMAP thread for every good frame. hdr holds bytes 12 up to
+   hdr_len (<= 64) of the frame; bytes 0..11 (MAC addresses) are NOT filled
+   (read them with smap_fifo_read(0, hdr, 12) when needed; hdr is writable).
+   Return 1 if the frame was read exactly to its end, else 0: the driver then
+   moves the read pointer to the end of the frame. */
 int smap_register_rx_callback(int (*cb)(u16 len, const u8 *hdr, u16 hdr_len), u16 n_bytes);
 /* read bytes of the current RX frame (frame-relative offset); only inside the callback */
 void smap_fifo_read(u16 offset, void *dst, u32 bytes);
+/* same, DMA only with 128-byte blocks: bytes must be a multiple of 128 */
+void smap_fifo_read_dma128(u16 offset, void *dst, u32 bytes);
 
 void xfer_init(void);
 int HandleRxIntr(struct SmapDriverData *SmapDrivPrivData);

@@ -25,6 +25,7 @@
 #include "px.h"
 
 px_rx_t g_rx;
+static u32 g_csum_ctr;
 u8 *g_bufmem;
 u32 g_bufmem_size;
 
@@ -162,11 +163,24 @@ int rxeng_data(const u8 *hdr, plat_payload_reader_t rd, void *ctx)
         g_stats.rx_drops++;
         return 0;
     }
+    /* no divisions on the hot path (divu costs ~35 IOP cycles each):
+       slot by subtraction (< B iterations); packet index = (inner / 128) / 11
+       by multiplication, exact for inner / 128 <= 5632, i.e. any slot up to
+       PX_MAX_BUF_UNITS * PX_UNIT (checked exhaustively) */
     rel   = (u32)rel64;
-    si    = rel / g_rx.S;
-    inner = rel - si * g_rx.S;
-    pi    = inner / PX_PAYLOAD;
-    s     = &g_rx.slot[(g_rx.W_idx + si) % g_rx.B];
+    si    = 0;
+    inner = rel;
+    while (inner >= g_rx.S) {
+        inner -= g_rx.S;
+        si++;
+    }
+    pi = ((inner >> 7) * 0xBA2Fu) >> 19;
+    {
+        u32 idx = g_rx.W_idx + si;
+        if (idx >= g_rx.B)
+            idx -= g_rx.B;
+        s = &g_rx.slot[idx];
+    }
     bit   = 1u << (pi & 31);
 
     if (inner != pi * PX_PAYLOAD || s->state != SLOT_FILLING || pi >= s->npkts) {
@@ -199,7 +213,8 @@ int rxeng_data(const u8 *hdr, plat_payload_reader_t rd, void *ctx)
     dst = s->mem + inner;
     if (!(g_rx.flags & PX_OW_SINK_NODMA)) {
         rd(ctx, dst, wl);
-        if (g_cfg.csum != 0 && (g_cfg.csum == 1 || pktno % g_cfg.csum == 0)) {
+        if (g_cfg.csum != 0 && ++g_csum_ctr >= g_cfg.csum) { /* every N-th packet */
+            g_csum_ctr = 0;
             if (px_fletcher(dst, wl) != csum) {
                 g_stats.csum_errors++;
                 return 1; /* bit stays clear: SACK makes the PC resend it */

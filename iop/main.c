@@ -9,7 +9,8 @@
  *   ack          12            periodic and on-demand ACKs
  *   writer       20            full buffers -> disk
  *   control      30            commands, FatFs, benches, start-up
- *   rpc          40            SIF RPC: status for the EE
+ *   rpc          40            SIF RPC: status for the EE (priority 14 hung the
+ *                              IOP on a real PS2, 2026-11-22)
  *   idle         126           CPU load meter
  */
 #include "irx_imports.h"
@@ -25,6 +26,7 @@ int plat_find_disk(void);
 void plat_identify(void);
 void plat_idle_thread(void *arg);
 void rpc_thread(void *arg);
+extern int g_writer_tid;
 
 static iop_sys_clock_t g_ack_clk;
 
@@ -148,7 +150,7 @@ int _start(int argc, char *argv[])
 
     if (start_thread(plat_idle_thread, 126, 0x200) < 0 ||
         start_thread(ack_thread, 12, 0x1000) < 0 ||
-        start_thread(writer_thread, 20, 0x1000) < 0 ||
+        (g_writer_tid = start_thread(writer_thread, 20, 0x1000)) < 0 ||
         start_thread(rpc_thread, 40, 0x1000) < 0 ||
         start_thread(init_thread, 30, 0x2000) < 0)
         return MODULE_NO_RESIDENT_END;

@@ -55,6 +55,12 @@ void plat_set_peer(const void *peer);
 
 /* ---- called every ack_ms from the ack thread (periodic platform work) */
 void plat_periodic(void);
+/* stops pushing status into EE memory and waits for the last push
+   (before the EE starts another program) */
+void plat_push_stop(void);
+/* writer: run the next ATA command above the RX thread (on=1) or back at
+   the writer priority (on=0; lets RX drain the FIFO right away) */
+void plat_writer_boost(int on);
 
 /* ---- CPU load: increments of the idle thread (0 if unsupported) */
 u32 plat_idle_count(void);

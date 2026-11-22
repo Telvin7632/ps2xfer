@@ -212,6 +212,32 @@ static u32 pad_held(void)
 
 static SifRpcClientData_t g_rpc;
 static px_stats_t g_st __attribute__((aligned(64)));
+/* written by the IOP via SIF DMA (PX_RPC_SET_PUSH); read only uncached */
+static px_stats_t g_push __attribute__((aligned(64)));
+static u32 g_push_arg[4] __attribute__((aligned(64)));
+
+/* copies the pushed status into g_st; 0 if nothing was pushed yet */
+static int read_push(void)
+{
+    static px_stats_t a, b;
+    const volatile u8 *u = (const volatile u8 *)((u32)&g_push | 0x20000000); /* uncached */
+    int tries;
+
+    for (tries = 0; tries < 4; tries++) { /* two equal copies = not torn */
+        unsigned int i;
+        for (i = 0; i < sizeof(a); i++)
+            ((u8 *)&a)[i] = u[i];
+        for (i = 0; i < sizeof(b); i++)
+            ((u8 *)&b)[i] = u[i];
+        if (memcmp(&a, &b, sizeof(a)) == 0) {
+            if (a.version == 0)
+                return 0;
+            memcpy(&g_st, &a, sizeof(g_st));
+            return 1;
+        }
+    }
+    return 0;
+}
 
 static int rpc(int fn)
 {
@@ -355,6 +381,13 @@ int main(int argc, char *argv[])
     while (SifBindRpc(&g_rpc, PX_RPC_SID, 0) < 0 || g_rpc.server == NULL)
         nopdelay();
 
+    /* ask the IOP to push its status (the RPC thread is starved during a
+       transfer); flush first so no dirty cache line overwrites the DMA data */
+    memset(&g_push, 0, sizeof(g_push));
+    FlushCache(0);
+    g_push_arg[0] = (u32)&g_push & 0x1fffffff;
+    SifCallRpc(&g_rpc, PX_RPC_SET_PUSH, 0, g_push_arg, sizeof(g_push_arg), &g_st, sizeof(g_st), NULL, NULL);
+
     scr_clear();
     scr_setXY(0, 1);
     scr_printf("  ps2xfer v" VERSION " - PC -> PS2 HDD (exFAT) over Ethernet");
@@ -364,7 +397,17 @@ int main(int argc, char *argv[])
         u64 rx;
         u32 btn;
 
-        rpc(PX_RPC_GET_STATS);
+        {
+            /* the pushed status, unless it went stale (push stopped on
+               EXIT, or not started): then ask by RPC */
+            static u32 last_up, stale;
+            if (read_push() && g_st.uptime_ms != last_up) {
+                last_up = g_st.uptime_ms;
+                stale = 0;
+            } else if (++stale >= 2) {
+                rpc(PX_RPC_GET_STATS);
+            }
+        }
         now = clock();
         rx = u64of(g_st.written_lo, g_st.written_hi);
         if ((g_st.flags & PX_SF_XFER) && !was_xfer) {

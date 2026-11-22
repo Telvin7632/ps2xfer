@@ -108,6 +108,7 @@ static void do_shutdown(void)
 {
     int st;
 
+    plat_push_stop(); /* the EE may start another program soon */
     if (g_rx.active)
         fsops_abort(NULL, 0);
     px_ata_lock();

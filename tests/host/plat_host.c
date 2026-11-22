@@ -168,6 +168,8 @@ void plat_set_peer(const void *peer)
 u32 plat_idle_count(void) { return 0; }
 
 void plat_periodic(void) {}
+void plat_push_stop(void) {}
+void plat_writer_boost(int on) { (void)on; }
 
 u32 plat_bench_micro(u32 *vals, u32 n)
 {

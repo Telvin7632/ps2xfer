@@ -13,6 +13,7 @@
 #include <loadcore.h>
 #include <poweroff.h>
 #include <sifcmd.h>
+#include <sifman.h>
 #include <stdio.h>
 #include <sysclib.h>
 #include <sysmem.h>

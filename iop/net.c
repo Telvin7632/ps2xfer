@@ -23,6 +23,9 @@ typedef struct peer {
 static u8 g_mac[6];
 static u8 g_ip[4];
 static u16 g_port;
+static u16 g_port_be;    /* port as it appears in the frame (big-endian u16 read LE) */
+static u16 g_ip16[2];    /* our IP as two u16 loads from frame offset 30 */
+static int g_payload_read;
 static peer_t g_peer;
 static int g_tx_sem = -1;
 static u16 g_ip_id;
@@ -61,6 +64,8 @@ void net_init(u32 ip, u16 port)
     g_ip[2] = (u8)(ip >> 8);
     g_ip[3] = (u8)ip;
     g_port  = port;
+    g_port_be = (u16)((port >> 8) | (port << 8));
+    memcpy(g_ip16, g_ip, 4);
     SMAPGetMACAddress(g_mac);
     memcpy(g_stats.mac, g_mac, 6);
 
@@ -164,25 +169,67 @@ static void handle_icmp(u8 *f, u32 len)
 
 static void rd_payload(void *ctx, void *dst, u32 len)
 {
+    u64 t0 = 0;
+
     (void)ctx;
-    if (g_cfg.prof) {
-        u64 t0 = plat_ticks();
+    if (g_cfg.prof)
+        t0 = plat_ticks();
+    u32 blk = (g_cfg.dma_block != 0 && g_cfg.dma_block < g_dma_max_block_size) ? g_cfg.dma_block
+                                                                                : g_dma_max_block_size;
+
+    if ((len & 127) == 0 && blk == 128)
+        smap_fifo_read_dma128(64, dst, len); /* 1408 = 11 x 128: one DMA, no PIO */
+    else
         smap_fifo_read(64, dst, len);
+    g_payload_read = 1;
+    if (t0)
         g_prof_dma += (u32)(plat_ticks() - t0);
-    } else {
-        smap_fifo_read(64, dst, len);
-    }
 }
 
-/* SMAP RX callback: runs on the SMAP thread for every good frame */
+/* SMAP RX callback: runs on the SMAP thread for every good frame.
+   hdr: frame bytes 12..63 (0..11 not read yet), see smap.h. */
 static int rx_cb(u16 len, const u8 *hdr, u16 hdr_len)
 {
     u16 type;
     u32 plen;
     u64 t0 = 0;
+    u8 *h = (u8 *)hdr;
 
     if (hdr_len < 40)
         return 0;
+
+    /* ---- fast path: DATA for us (IPv4 without options, not fragmented, UDP) */
+    if (hdr_len == 64 && hdr[42] == PX_T_DATA && hdr[23] == 17 && hdr[14] == 0x45 &&
+        *(const u16 *)(hdr + 12) == 0x0008 && *(const u16 *)(hdr + 36) == g_port_be &&
+        *(const u16 *)(hdr + 30) == g_ip16[0] && *(const u16 *)(hdr + 32) == g_ip16[1] &&
+        (*(const u16 *)(hdr + 20) & 0xff3f) == 0) {
+        u32 wl = ((u32)*(const u16 *)(hdr + 62) + 3) & ~3u;
+
+        plen = be16(hdr + 38);
+        if (plen < 8 + PX_DATA_HDR + wl || 34 + plen > len) {
+            g_stats.rx_drops++;
+            return 0;
+        }
+        g_payload_read = 0;
+        if (g_cfg.prof)
+            t0 = plat_ticks();
+        if (rxeng_data(hdr + 42, rd_payload, NULL))
+            rxeng_maybe_ack(1);
+        if (g_cfg.prof) {
+            g_prof_total += (u32)(plat_ticks() - t0);
+            if (++g_prof_n == 256) {
+                g_stats.prof_dma     = g_prof_dma / 256;
+                g_stats.prof_total   = g_prof_total / 256;
+                g_stats.prof_samples += 256;
+                g_prof_dma = g_prof_total = g_prof_n = 0;
+            }
+        }
+        /* the payload DMA ended exactly at the end of the frame? */
+        return (g_payload_read && len == 64 + wl) ? 1 : 0;
+    }
+
+    /* ---- everything else is rare: read the MAC addresses too */
+    smap_fifo_read(0, h, 12);
     type = be16(hdr + 12);
 
     if (type == 0x0800 && hdr_len >= 44 && hdr[14] == 0x45 && (be16(hdr + 20) & 0x3fff) == 0) {
@@ -196,32 +243,11 @@ static int rx_cb(u16 len, const u8 *hdr, u16 hdr_len)
             if (plen < 8 || 34 + plen > len)
                 return 0;
             plen -= 8;
+            if (hdr[42] == PX_T_DATA)
+                return 0; /* DATA that missed the fast path (broadcast, short header) */
 
-            /* ---- fast path */
-            if (hdr[42] == PX_T_DATA && hdr_len == 64 && plen >= PX_DATA_HDR) {
-                u32 wl = ((u32)*(const u16 *)(hdr + 62) + 3) & ~3u;
-                if (PX_DATA_HDR + wl > plen) {
-                    g_stats.rx_drops++;
-                    return 0;
-                }
-                if (g_cfg.prof)
-                    t0 = plat_ticks();
-                if (rxeng_data(hdr + 42, rd_payload, NULL))
-                    rxeng_maybe_ack(1);
-                if (g_cfg.prof) {
-                    g_prof_total += (u32)(plat_ticks() - t0);
-                    if (++g_prof_n == 256) {
-                        g_stats.prof_dma     = g_prof_dma / 256;
-                        g_stats.prof_total   = g_prof_total / 256;
-                        g_stats.prof_samples += 256;
-                        g_prof_dma = g_prof_total = g_prof_n = 0;
-                    }
-                }
-                return 0;
-            }
-
-            /* ---- control: copy the UDP payload (from frame offset 40, so the
-               copy stays 4-aligned) and hand it to the control thread */
+            /* control: copy the UDP payload (from frame offset 40, so the copy
+               stays 4-aligned) and hand it to the control thread */
             if (plen > PX_MBOX_SIZE || 42 + plen > sizeof(g_small))
                 return 0;
             {

@@ -100,6 +100,7 @@ static const struct cfg_key cfg_keys[] = {
     K("prof", prof, 0, 1, 1),
     K("state_mb", state_mb, 1, 4096, 1),
     K("fs_iomanx", fs_iomanx, 0, 1, 0),
+    K("wr_boost", wr_boost, 0, 1, 1),
 };
 
 int px_cfg_set(px_cfg_t *c, const char *kv, int live)
@@ -224,7 +225,13 @@ u32 px_ms(void)
 
     if (g_t0 == 0)
         g_t0 = t;
+#ifdef _IOP
+    /* 36864 ticks per ms = 36 << 10: 32-bit division instead of __udivdi3
+       (valid for 2^42 ticks, i.e. 33 hours) */
+    return (u32)((t - g_t0) >> 10) / 36;
+#else
     return (u32)((t - g_t0) / plat_ticks_per_ms());
+#endif
 }
 
 void px_strlcpy(char *dst, const char *src, u32 size)

@@ -33,6 +33,8 @@ typedef struct px_cfg {
     u32 prof;          /* 1: per-packet cycle profiling */
     u32 state_mb;      /* resume-state update interval, MiB */
     u32 fs_iomanx;     /* 1: bdmfs_fatfs owns the volume; our FatFs off */
+    u32 wr_boost;      /* 1: each ATA write chunk runs above the RX thread;
+                          use with a small ata_chunk (FIFO holds ~1.3 ms) */
 } px_cfg_t;
 
 extern px_cfg_t g_cfg;

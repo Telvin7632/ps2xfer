@@ -45,9 +45,13 @@ int px_extent_write(const px_extent_t *e, u64 rel_sector, const void *buf, u32 c
         u32 n = count < chunk ? count : chunk;
         int r;
 
+        if (g_cfg.wr_boost)
+            plat_writer_boost(1);
         px_ata_lock();
         r = plat_bd_write(e->lba + rel_sector, p, n);
         px_ata_unlock();
+        if (g_cfg.wr_boost)
+            plat_writer_boost(0);
         if (r != 0)
             return PX_EIO;
         p += n * 512;

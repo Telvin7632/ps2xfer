@@ -34,6 +34,11 @@ poweroff_IMPORTS_start
 I_AddPowerOffHandler
 poweroff_IMPORTS_end
 
+sifman_IMPORTS_start
+I_sceSifSetDma
+I_sceSifDmaStat
+sifman_IMPORTS_end
+
 sifcmd_IMPORTS_start
 I_sceSifInitRpc
 I_sceSifRegisterRpc
@@ -70,6 +75,7 @@ I_StartThread
 I_DelayThread
 I_DeleteThread
 I_GetThreadId
+I_ChangeThreadPriority
 I_GetSystemTime
 I_SetAlarm
 I_USec2SysClock

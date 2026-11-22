@@ -10,6 +10,10 @@
 #define PX_RPC_SID       0x50585846 /* "FXXP" */
 #define PX_RPC_GET_STATS 1
 #define PX_RPC_EXIT      2
+/* EE sends the physical address of a 64-byte aligned px_stats_t; the IOP
+   then pushes the status there by SIF DMA every 250 ms from its high-priority
+   ack thread (the RPC thread starves while a transfer keeps the IOP busy) */
+#define PX_RPC_SET_PUSH  3
 
 #define PX_STATS_VERSION 2
 

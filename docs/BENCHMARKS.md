@@ -123,13 +123,19 @@ python ps2xfer.py bench combined --size-mb 4096
 python ps2xfer.py set ata_chunk=64      # etc.
 ```
 
-| ata_chunk | csum | bufs × units | MB/s | Retransmits | RX errors / overruns | IOP CPU % |
-|---:|---:|---|---:|---:|---:|---:|
-| 0 (704) | 16 | 3 × 8 | | | | |
-| 64 | 16 | 3 × 8 | | | | |
-| 256 | 16 | 3 × 8 | | | | |
-| 0 | 0 | 3 × 8 | | | | |
-| 0 | 1 | 3 × 8 | | | | |
+All with 0 retransmits, 0 RX errors/overruns, 0 drops, 0 checksum errors.
+
+| Run | Size | MB/s | PC waits for credit | IOP CPU % |
+|---|---:|---:|---:|---:|
+| defaults (ata_chunk = buffer, csum 16, 3 × 352 KiB) | 4 GiB | **9.47** | | 100 |
+| defaults | 1 GiB | 9.46 | 18–19 % | 100 |
+| csum=0 | 1 GiB | 9.45 | | 100 |
+| ata_chunk=256 | 1 GiB | 9.32 | | 100 |
+| bufs=6, buf_units=4 (6 × 176 KiB) | 1 GiB | 9.29 | | 100 |
+| ack_every=64 | 1 GiB | 9.46 | | 100 |
+| client --burst 4 / 6 / 8 | 1 GiB | 9.51 / 9.57 / 9.57 | | 100 |
+| RX micro-optimisations (no divisions, 13-word header, direct DMA) | 4 GiB | 9.50 | | 91.8 |
+| wr_boost=1 + ata_chunk 128 / 64 / 32 | 512 MiB | 9.39 / 9.00 / 8.44 | 19 / 22 / 27 % | 100 / 89 / 100 |
 
 ## 5. Python client
 
@@ -153,14 +159,27 @@ pps_max = 36.864e6 / (c_rx + 1408 * 36.864e6 * (1/R_smap + 1/R_ata) + c_csum)
 
 | Term | Value | Source |
 |---|---|---|
-| R_ata (raw write, MB/s) | | §2 |
-| R_smap (1408 B DMA) = 1408 / payload DMA ticks × 36.864e6 | | §3 profile |
-| c_rx (RX path without DMA, ticks) | | §3 profile |
-| c_csum | | §1 |
-| **pps_max / MB/s predicted** | | |
-| **measured (combined)** | | §4 |
+| R_ata (raw write) | 56 MB/s → ~950 ticks per 1408 bytes (writer thread time in the combined profile: 957) | §2, profile |
+| R_smap (1408 B payload DMA, busy-wait in ps2dev9) | ~2100 ticks → ~25 MB/s | §3 profile |
+| whole RX cost per packet | ~4400 ticks (IOP 95–100 % busy at 8150 pkt/s in net-sink) | §3 |
+| c_csum (sample 1/16) | ~130 ticks; removing it changes nothing measurable | §1, §4 |
+| **predicted ceiling** | 36.864e6 / (4400 + 950) ≈ 6900 pkt/s ≈ **9.7 MB/s** | |
+| **measured (combined)** | **9.45–9.50 MB/s** (6735 pkt/s), the PC waits for credit 18 % of the time | §4 |
+
+Per-thread profile (prof=1, combined): SMAP thread 4416 ticks/packet (0.04
+wake-ups per packet: the thread hardly ever sleeps), writer 5373 ticks/packet
+of wall time of which ~4400 is preemption by the SMAP thread, wall 5473.
+
+Conclusion: with the stock `ps2dev9` (synchronous DMA: the CPU spins during
+every SMAP and ATA DMA) the IOP is saturated at ~9.5–9.7 MB/s on this console.
+None of the run-time knobs moves it. The remaining lever is overlapping the
+SMAP payload DMA with CPU work, which needs an asynchronous DMA path in a
+patched dev9 module.
 
 ## Before / after (Phase 3)
 
 | Change | MB/s before | MB/s after |
 |---|---:|---:|
+| RX micro-optimisations (combined, 4 GiB) | 9.47 | 9.50 |
+| client burst 2 → 6 (combined, 1 GiB) | 9.46 | 9.57 |
+| writer priority boost (wr_boost) | 9.44 | ≤ 9.39 (worse) |

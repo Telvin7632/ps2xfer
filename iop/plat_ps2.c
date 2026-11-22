@@ -179,15 +179,67 @@ void plat_identify(void)
 
 void net_announce(void);
 
+extern u32 g_push_addr; /* rpc.c */
+
+/* status push to the EE by SIF DMA (see PX_RPC_SET_PUSH) */
+static int g_push_trid = -1;
+
+static void push_stats(u32 now)
+{
+    static px_stats_t buf __attribute__((aligned(64)));
+    static u32 last;
+    int trid = g_push_trid;
+    SifDmaTransfer_t t;
+    int st;
+
+    if (g_push_addr == 0 || now - last < 250)
+        return;
+    if (trid >= 0 && sceSifDmaStat(trid) >= 0)
+        return; /* previous push still in flight */
+    last = now;
+    g_stats.uptime_ms = now;
+    memcpy(&buf, &g_stats, sizeof(buf));
+    t.src  = &buf;
+    t.dest = (void *)g_push_addr;
+    t.size = sizeof(buf);
+    t.attr = 0;
+    CpuSuspendIntr(&st);
+    g_push_trid = sceSifSetDma(&t, 1);
+    CpuResumeIntr(st);
+}
+
+/* called from the control thread, which never preempts the ack thread (the
+   pusher), so no new push starts after g_push_addr is cleared */
+void plat_push_stop(void)
+{
+    int i;
+
+    g_push_addr = 0;
+    for (i = 0; i < 100 && g_push_trid >= 0 && sceSifDmaStat(g_push_trid) >= 0; i++)
+        DelayThread(1000);
+}
+
 void plat_periodic(void)
 {
     static u32 last;
     u32 now = px_ms();
 
+    push_stats(now);
+
     if (!(g_stats.flags & PX_SF_SESSION) && (g_stats.flags & PX_SF_NET_UP) && now - last >= 2000) {
         last = now;
         net_announce();
     }
+}
+
+#define WRITER_PRIO 20 /* main.c */
+int g_writer_tid = -1;  /* main.c */
+
+void plat_writer_boost(int on)
+{
+    if (GetThreadId() != g_writer_tid) /* only the writer thread, never ctrl/bench */
+        return;
+    ChangeThreadPriority(TH_SELF, on ? (int)g_cfg.rx_prio - 1 : WRITER_PRIO);
 }
 
 u32 plat_idle_count(void)

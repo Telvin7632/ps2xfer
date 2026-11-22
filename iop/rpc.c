@@ -5,6 +5,8 @@
 #include "irx_imports.h"
 #include "px.h"
 
+u32 g_push_addr; /* EE physical address for the status push, 0 = off */
+
 static SifRpcDataQueue_t g_qd;
 static SifRpcServerData_t g_sd;
 static u32 g_rpc_buf[(sizeof(px_stats_t) + 64) / 4] __attribute__((aligned(64)));
@@ -15,6 +17,10 @@ static void *rpc_handler(int fno, void *buf, int size)
     switch (fno) {
         case PX_RPC_GET_STATS:
             g_stats.uptime_ms = px_ms();
+            memcpy(buf, &g_stats, sizeof(g_stats));
+            break;
+        case PX_RPC_SET_PUSH:
+            g_push_addr = *(u32 *)buf;
             memcpy(buf, &g_stats, sizeof(g_stats));
             break;
         case PX_RPC_EXIT:

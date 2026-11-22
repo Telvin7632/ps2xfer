@@ -106,6 +106,15 @@ int smap_register_rx_callback(int (*cb)(u16 len, const u8 *hdr, u16 hdr_len), u1
  * Uses DMA for transfers >= 64 bytes, PIO otherwise.
  * Seeks to (g_current_frame_ptr + offset) before reading.
  */
+/* ps2xfer: payload fast path, bytes a multiple of 128, dst 4-aligned */
+void smap_fifo_read_dma128(u16 offset, void *dst, u32 bytes)
+{
+    volatile u8 *smap_regbase = SmapDriverData.smap_regbase;
+
+    SMAP_REG16(SMAP_R_RXFIFO_RD_PTR) = g_current_frame_ptr + offset;
+    dev9DmaTransfer(1, dst, (bytes >> 7) << 16 | 32, DMAC_TO_MEM);
+}
+
 void smap_fifo_read(u16 offset, void *dst, u32 bytes)
 {
     volatile u8 *smap_regbase = SmapDriverData.smap_regbase;
@@ -195,15 +204,24 @@ int HandleRxIntr(struct SmapDriverData *SmapDrivPrivData)
                 hdr_len &= ~3;
                 if (hdr_len == 64 && g_cfg.hdr_dma) {
                     smap_fifo_read(0, g_hdr_buf, 64);
-                } else {
-                    u32 *h = (u32 *)g_hdr_buf;
+                } else if (hdr_len > 12) {
+                    /* bytes 12.. only: the MAC addresses are not needed on the
+                       data path (the callback reads them when it needs them) */
+                    u32 *h = (u32 *)(g_hdr_buf + 12);
                     u16 k;
-                    SMAP_REG16(SMAP_R_RXFIFO_RD_PTR) = pointer;
-                    for (k = 0; k < hdr_len; k += 4)
+                    SMAP_REG16(SMAP_R_RXFIFO_RD_PTR) = pointer + 12;
+                    for (k = 12; k < hdr_len; k += 4)
                         *h++ = SMAP_REG32(SMAP_R_RXFIFO_DATA);
                 }
-                if (g_rx_callback != NULL)
-                    g_rx_callback(length, g_hdr_buf, hdr_len);
+                /* callback returns 1 if it read the frame to its end: then the
+                   read pointer is already where it must be */
+                if (g_rx_callback != NULL && g_rx_callback(length, g_hdr_buf, hdr_len) == 1) {
+                    NumPacketsReceived++;
+                    SMAP_REG8(SMAP_R_RXFIFO_FRAME_DEC) = 0;
+                    PktBdPtr->ctrl_stat = SMAP_BD_RX_EMPTY;
+                    SmapDrivPrivData->RxBDIndex++;
+                    continue;
+                }
                 /* ps2xfer: lets the SMAP thread skip the PHY link check (which
                    sleeps) while frames are arriving */
                 NumPacketsReceived++;
