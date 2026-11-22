@@ -178,6 +178,7 @@ int fsops_open_write(const u8 *req, u32 len, u8 *resp, u32 *rlen);
 int fsops_close(const u8 *req, u32 len, u8 *resp, u32 *rlen);
 int fsops_abort(const u8 *req, u32 len);
 int fsops_blocksums(const u8 *req, u32 len, u8 *resp, u32 *rlen);
+int fsops_diskinfo(u8 *resp, u32 *rlen);
 int fsops_read(const u8 *req, u32 len, u32 req_id, u8 *resp, u32 *rlen);
 /* writer helpers */
 int fsops_write_slot(px_slot_t *s);   /* 0 or PX_E* */
@@ -191,6 +192,8 @@ void fsops_bench_remove(void *fil);
 /* platform parts: fill up to n values, return count */
 u32 plat_bench_micro(u32 *vals, u32 n);
 /* fs_iomanx mode only; returns PX_* and fills ticks/idle */
+/* fs_iomanx mode: OPL-like read check through bdmfs_fatfs; text into out */
+int plat_fscheck(char *out, u32 max);
 int plat_bench_iomanx(u64 size, u32 chunk, u32 flags, u64 *wt, u32 *wi, u64 *rt, u32 *ri);
 
 #endif

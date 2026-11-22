@@ -28,6 +28,10 @@ I_close
 I_read
 I_write
 I_remove
+I_lseek
+I_dopen
+I_dread
+I_dclose
 iomanX_IMPORTS_end
 
 poweroff_IMPORTS_start

@@ -40,6 +40,7 @@
 #define PX_T_CLOSE      0x27
 #define PX_T_ABORT      0x28
 #define PX_T_BLOCKSUMS  0x29
+#define PX_T_DISKINFO   0x2B /* read-only: raw sectors 0 and 1 + mounted volume start */
 #define PX_T_READ       0x2A /* read a file range; data comes as READ_DATA */
 #define PX_READ_MAX     (256 * 1024)
 
@@ -123,6 +124,7 @@
 #define PX_BENCH_DISK_RAW   2
 #define PX_BENCH_DISK_FATFS 3
 #define PX_BENCH_DISK_IOMANX 4
+#define PX_BENCH_FSCHECK    5 /* fs_iomanx mode: list mass0:DVD through bdmfs_fatfs, read sector 16 of each ISO */
 
 /* word-Fletcher over 32-bit little-endian words:
  *   s1 = sum(w) mod 2^32;  s2 = sum of running s1 values mod 2^32

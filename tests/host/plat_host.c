@@ -187,6 +187,12 @@ u32 plat_bench_micro(u32 *vals, u32 n)
     return 0;
 }
 
+int plat_fscheck(char *out, u32 max)
+{
+    (void)out; (void)max;
+    return PX_ENOTSUP;
+}
+
 int plat_bench_iomanx(u64 size, u32 chunk, u32 flags, u64 *wt, u32 *wi, u64 *rt, u32 *ri)
 {
     (void)size; (void)chunk; (void)flags; (void)wt; (void)wi; (void)rt; (void)ri;

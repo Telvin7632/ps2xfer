@@ -34,6 +34,7 @@ T_DATA, T_ACK, T_READ_DATA = 0x10, 0x11, 0x12
 T_LIST, T_STAT, T_MKDIR, T_DELETE, T_RENAME, T_DF = 0x20, 0x21, 0x22, 0x23, 0x24, 0x25
 T_OPEN_WRITE, T_CLOSE, T_ABORT, T_BLOCKSUMS = 0x26, 0x27, 0x28, 0x29
 T_READ = 0x2A
+T_DISKINFO = 0x2B
 READ_MAX = 256 * 1024
 T_BENCH = 0x30
 F_RESPONSE = 0x80
@@ -919,6 +920,29 @@ def cmd_ls(args):
         cursor = nxt
 
 
+def cmd_diskinfo(args):
+    """read-only look at the partition table of the PS2 disk"""
+    c = connect(args)
+    r = c.call(T_DISKINFO, timeout=10.0)
+    mbr, gpt = r[:512], r[512:1024]
+    volbase, fstype = struct.unpack_from("<QI", r, 1024)
+    print(f"  sector 0 boot signature: {'55 AA (MBR present)' if mbr[510:512] == bytes([0x55, 0xAA]) else mbr[510:512].hex()}")
+    for i in range(4):
+        e = mbr[446 + 16 * i:446 + 16 * (i + 1)]
+        ptype = e[4]
+        start, count = struct.unpack_from("<II", e, 8)
+        if ptype:
+            name = {0x07: "exFAT/NTFS", 0x0C: "FAT32 LBA", 0xEE: "GPT protective", 0x83: "Linux"}.get(ptype, "?")
+            print(f"  MBR partition {i}: type 0x{ptype:02X} ({name}), start LBA {start}, {count} sectors "
+                  f"({fmt_size(count * 512)})")
+    print(f"  sector 1: {'GPT header signature EFI PART present' if gpt[:8] == b'EFI PART' else 'no GPT header'}")
+    if gpt[:8] == b"EFI PART":
+        cur, backup, first, last = struct.unpack_from("<QQQQ", gpt, 24)
+        ent_lba, nent, esz = struct.unpack_from("<QII", gpt, 72)
+        print(f"    GPT: header LBA {cur}, backup LBA {backup}, usable {first}..{last}, {nent} entries at LBA {ent_lba}")
+    print(f"  ps2xfer mounted the volume at LBA {volbase} (FatFs type {fstype}: 4 = exFAT)")
+
+
 def cmd_stat(args):
     c = connect(args)
     size, ft, attr, contig = struct.unpack_from("<QIBB", c.call(T_STAT, Conn.path(args.path)))
@@ -1214,6 +1238,10 @@ def cmd_bench(args):
     if args.kind == "selftest":
         return bench_selftest(args)
     c = connect(args)
+    if args.kind == "fscheck":
+        r = c.call(T_BENCH, struct.pack("<IIII", 5, 0, 0, 0), timeout=60.0, retries=2)
+        print(r[112:].split(b"\0")[0].decode(errors="replace"))
+        return
     if args.kind == "micro":
         r = bench_disk(c, BENCH_MICRO, 0, 0, False)
         names = ["fletcher ticks/KiB", "memcpy ticks/KiB", "IOP total free", "IOP max free",
@@ -1348,6 +1376,7 @@ def main(argv=None):
     s.add_argument("path", nargs="?", default="/")
     s.set_defaults(func=cmd_ls)
     sub.add_parser("df").set_defaults(func=cmd_df)
+    sub.add_parser("diskinfo", help="read-only: show the partition table of the PS2 disk").set_defaults(func=cmd_diskinfo)
     s = sub.add_parser("stat")
     s.add_argument("path")
     s.set_defaults(func=cmd_stat)
@@ -1364,7 +1393,7 @@ def main(argv=None):
 
     s = sub.add_parser("bench", help="Phase 1 benchmarks")
     s.add_argument("kind", choices=["selftest", "micro", "disk-raw", "disk-fatfs", "disk-iomanx",
-                                    "net-sink", "net-sink-nodma", "combined"])
+                                    "net-sink", "net-sink-nodma", "combined", "fscheck"])
     s.add_argument("--size-mb", type=int, default=512)
     s.add_argument("--chunks", help="comma-separated chunk sizes for disk benches")
     s.add_argument("--count", type=int, default=50, help="selftest: thousands of packets")

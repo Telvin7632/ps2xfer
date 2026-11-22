@@ -755,6 +755,32 @@ int fsops_blocksums(const u8 *req, u32 len, u8 *resp, u32 *rlen)
     return PX_OK;
 }
 
+/* DISKINFO (read-only): raw sector 0 (MBR), raw sector 1 (GPT header if
+   any), u64 start LBA of the mounted volume, u32 FatFs type, u32 0 */
+int fsops_diskinfo(u8 *resp, u32 *rlen)
+{
+    int r;
+
+    if (plat_bd_sectors() == 0)
+        return PX_ENODISK;
+    px_fs_lock();
+    px_ata_lock();
+    r = plat_bd_read(0, g_sector, 1);
+    if (r == 0)
+        memcpy(resp, g_sector, 512);
+    if (r == 0)
+        r = plat_bd_read(1, g_sector, 1);
+    if (r == 0)
+        memcpy(resp + 512, g_sector, 512);
+    px_ata_unlock();
+    wr64(resp + 1024, g_mounted ? (u64)g_fs.volbase : 0);
+    wr32(resp + 1032, g_mounted ? g_fs.fs_type : 0);
+    wr32(resp + 1036, 0);
+    px_fs_unlock();
+    *rlen = 1040;
+    return r == 0 ? PX_OK : PX_EIO;
+}
+
 /* READ: body u64 offset, u32 length (<= PX_READ_MAX), path\0.
    The data is sent as READ_DATA packets (DATA layout: offset, pkt_seq =
    req_id, csum 0, handle 0, len; LAST on the final one) before the response:

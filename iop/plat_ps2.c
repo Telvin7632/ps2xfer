@@ -279,6 +279,43 @@ u32 plat_bench_micro(u32 *vals, u32 n)
     return k;
 }
 
+/* Does what OPL does with the games: open "mass0:DVD", list it, open each
+   .iso and read sector 16 (ISO9660 "CD001"). Only in fs_iomanx mode, where
+   bdmfs_fatfs (as in OPL) owns the volume. */
+int plat_fscheck(char *out, u32 max)
+{
+    static u8 sec[2048] __attribute__((aligned(64)));
+    iox_dirent_t de;
+    int dfd, fd, n = 0, r;
+    u32 len = 0;
+    char path[300];
+
+    if (!g_cfg.fs_iomanx)
+        return PX_ENOTSUP;
+    out[0] = 0;
+    dfd = dopen("mass0:DVD");
+    len += sprintf(out + len, "dopen mass0:DVD = %d\n", dfd);
+    if (dfd < 0)
+        return PX_OK;
+    while ((r = dread(dfd, &de)) > 0 && len + 200 < max) {
+        if (!FIO_S_ISREG(de.stat.mode))
+            continue;
+        sprintf(path, "mass0:DVD/%s", de.name);
+        fd = open(path, O_RDONLY);
+        if (fd < 0) {
+            len += sprintf(out + len, "%.60s: open %d\n", de.name, fd);
+            continue;
+        }
+        r = lseek(fd, 16 * 2048, SEEK_SET);
+        n = (r >= 0) ? read(fd, sec, 2048) : r;
+        len += sprintf(out + len, "%.60s: size %u/%u, lseek %d, read %d, %s\n", de.name, de.stat.hisize,
+                       de.stat.size, r, n, (n == 2048 && memcmp(sec + 1, "CD001", 5) == 0) ? "CD001 OK" : "NO CD001");
+        close(fd);
+    }
+    dclose(dfd);
+    return PX_OK;
+}
+
 int plat_bench_iomanx(u64 size, u32 chunk, u32 flags, u64 *wt, u32 *wi, u64 *rt, u32 *ri)
 {
     const char *path = "mass0:/ps2xfer_bench.bin";

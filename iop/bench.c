@@ -178,6 +178,17 @@ int bench_run(const u8 *req, u32 len, u8 *resp, u32 *rlen)
         case PX_BENCH_DISK_FATFS:
             r = (size == 0) ? PX_EINVAL : bench_fatfs(size, chunk, flags, &wt, &wi, &rt, &ri);
             break;
+        case PX_BENCH_FSCHECK: {
+            /* text goes after the 112-byte result block */
+            static char txt[1200];
+            r = plat_fscheck(txt, sizeof(txt));
+            memset(resp, 0, BENCH_RESP_LEN);
+            wr32(resp, kind);
+            strcpy((char *)resp + BENCH_RESP_LEN, txt);
+            *rlen = BENCH_RESP_LEN + (u32)strlen(txt) + 1;
+            px_log("fscheck done: %d\n", r);
+            return r;
+        }
         case PX_BENCH_DISK_IOMANX:
             r = (size == 0) ? PX_EINVAL : plat_bench_iomanx(size, chunk, flags, &wt, &wi, &rt, &ri);
             break;
