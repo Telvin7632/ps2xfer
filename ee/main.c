@@ -42,6 +42,7 @@ IRX_DECL(ps2xfer);
 static char g_args[MAX_ARGS][48];
 static int g_nargs;
 static char g_cfg_src[64] = "defaults";
+static char g_exit_elf[128]; /* EE-only key: ELF to start on exit (e.g. ps2link) */
 static int g_fs_iomanx;
 
 static void add_arg(const char *kv)
@@ -51,6 +52,13 @@ static void add_arg(const char *kv)
 
     if (kv[klen] != '=')
         return;
+    if (strncmp(kv, "exit_elf=", 9) == 0) { /* not an IOP module argument */
+        if (g_exit_elf[0] == 0) {
+            strncpy(g_exit_elf, kv + 9, sizeof(g_exit_elf) - 1);
+            g_exit_elf[sizeof(g_exit_elf) - 1] = 0;
+        }
+        return;
+    }
     for (i = 0; i < g_nargs; i++) /* later sources do not override earlier ones */
         if (strncmp(g_args[i], kv, klen + 1) == 0)
             return;
@@ -86,7 +94,7 @@ static int load_ini(const char *path)
     if (read_file(path, buf, sizeof(buf)) < 0)
         return -1;
     for (line = strtok_r(buf, "\r\n", &save); line; line = strtok_r(NULL, "\r\n", &save)) {
-        char kv[48];
+        char kv[160];
         int i = 0, j = 0;
         while (line[i] == ' ' || line[i] == '\t')
             i++;
@@ -382,11 +390,13 @@ int main(int argc, char *argv[])
             rpc(PX_RPC_EXIT);
         }
         if (g_st.flags & PX_SF_EXIT) {
-            line(22, "  Bye. Returning to the browser.");
+            line(22, g_exit_elf[0] ? "  Bye. Starting the exit_elf program." : "  Bye. Returning to the browser.");
             {
                 clock_t t = clock();
                 while (clock() - t < CLOCKS_PER_SEC) {}
             }
+            if (g_exit_elf[0])
+                LoadExecPS2(g_exit_elf, 0, NULL); /* e.g. mc0:/BOOT/PS2LINK.ELF */
             Exit(0);
         }
         {

@@ -5,6 +5,10 @@
 ip=192.168.0.10
 port=7690
 
+# ELF to start when ps2xfer exits (START held / "ps2xfer.py exit"), instead of
+# returning to the browser. Handy with ps2link: exit_elf=mc0:/BOOT/PS2LINK.ELF
+# exit_elf=
+
 # ---- tuning (see docs/DESIGN.md and docs/BENCHMARKS.md); defaults shown
 # bufs=3            write buffers
 # buf_units=8       buffer size in units of 45056 bytes (8 = 352 KiB)
