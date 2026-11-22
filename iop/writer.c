@@ -89,8 +89,14 @@ void writer_thread(void *arg)
         while ((s = take_full_slot()) != NULL) {
             int err = 0;
 
+            u64 t0 = g_cfg.prof ? plat_ticks() : 0;
+
             if (!(g_rx.flags & (PX_OW_SINK | PX_OW_SINK_NODMA)))
                 err = fsops_write_slot(s);
+            if (t0) {
+                g_stats.prof_writer16 += (u32)((plat_ticks() - t0) >> 4);
+                g_stats.prof_writer_slots++;
+            }
             finish_slot(s, err);
             plat_sem_signal(g_ack_sem); /* credit changed: ACK now */
             if (!err)
@@ -110,7 +116,14 @@ void ack_thread(void *arg)
 {
     (void)arg;
     for (;;) {
+        u64 t0;
+
         plat_sem_wait(g_ack_sem);
+        t0 = g_cfg.prof ? plat_ticks() : 0;
         ack_tick();
+        if (t0) {
+            g_stats.prof_ack16 += (u32)((plat_ticks() - t0) >> 4);
+            g_stats.prof_ack_runs++;
+        }
     }
 }

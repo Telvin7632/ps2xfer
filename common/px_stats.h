@@ -11,7 +11,7 @@
 #define PX_RPC_GET_STATS 1
 #define PX_RPC_EXIT      2
 
-#define PX_STATS_VERSION 1
+#define PX_STATS_VERSION 2
 
 /* state flags */
 #define PX_SF_NET_UP     0x0001 /* SMAP initialised, link up */
@@ -61,6 +61,12 @@ typedef struct px_stats {
     unsigned int disk_errors;
     /* profiling (prof=1): average cycles per accepted packet */
     unsigned int prof_hdr, prof_dma, prof_total, prof_samples;
+    /* thread time accounting (prof=1), cumulative, in units of 16 ticks;
+       wall time from wake-up to sleep, so it includes preemption */
+    unsigned int prof_smap16, prof_smap_wakes;
+    unsigned int prof_writer16, prof_writer_slots;
+    unsigned int prof_ack16, prof_ack_runs;
+    unsigned int reserved0, reserved1;
     char last_error[48];
 } px_stats_t;
 

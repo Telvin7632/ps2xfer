@@ -295,10 +295,12 @@ static void draw(float cur, float avg, int exit_hold)
     y++;
     if (s->flags & PX_SF_XFER) {
         float pct = fsize ? (float)wr * 100.0f / (float)fsize : 0;
-        float eta = avg > 0 ? (float)(fsize - wr) / (avg * 1e6f) : 0;
+        float rate = cur > 0.05f ? cur : avg; /* ETA follows the current speed */
+        int eta = rate > 0 ? (int)((float)(fsize - wr) / (rate * 1e6f)) : 0;
         line(y++, "  File: %.60s", s->file);
         line(y++, "  Progress: %5.1f%%   %llu / %llu MiB", pct, wr >> 20, fsize >> 20);
-        line(y++, "  Speed: %5.2f MB/s (avg %5.2f)   ETA %d:%02d", cur, avg, (int)eta / 60, (int)eta % 60);
+        line(y++, "  Speed: %5.2f MB/s (avg %5.2f)   ETA %d:%02d:%02d", cur, avg, eta / 3600, eta / 60 % 60,
+             eta % 60);
     } else {
         line(y++, "  %s", (s->flags & PX_SF_SESSION) ? "Connected. Idle." : "Waiting for the PC client...");
         line(y++, " ");
@@ -371,10 +373,14 @@ int main(int argc, char *argv[])
             cur = avg = 0;
         }
         was_xfer = (g_st.flags & PX_SF_XFER) != 0;
-        if (now - prev_t >= CLOCKS_PER_SEC) {
+        /* every poll (4x per second): instantaneous rate, smoothed with a
+           ~1 s time constant (the written counter moves in 352 KiB steps) */
+        if (now - prev_t >= CLOCKS_PER_SEC / 8) {
             float dt = (float)(now - prev_t) / CLOCKS_PER_SEC;
             if (was_xfer) {
-                cur = (float)(rx - prev_rx) / dt / 1e6f;
+                float inst = (float)(rx - prev_rx) / dt / 1e6f;
+                float a = dt / (1.0f + dt);
+                cur = (cur <= 0.0f) ? inst : cur + (inst - cur) * a;
                 if (now > xfer_start_t)
                     avg = (float)(rx - xfer_start_bytes) / ((float)(now - xfer_start_t) / CLOCKS_PER_SEC) / 1e6f;
             }

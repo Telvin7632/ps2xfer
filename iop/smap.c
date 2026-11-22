@@ -23,6 +23,7 @@
 #include <speedregs.h>
 
 #include "smap.h"
+#include "px.h"
 
 /*  There is a difference in how the transmissions are made,
     between this driver and the SONY original.
@@ -406,6 +407,9 @@ static void IntrHandlerThread(struct SmapDriverData *SmapDrivPrivData)
             M_DEBUG("smap: WaitEventFlag -> %d\n", result);
             break;
         }
+        {
+            /* ps2xfer: thread time accounting (prof=1) */
+            u64 prof_t0 = g_cfg.prof ? plat_ticks() : 0;
 
         if (EFBits & SMAP_EVENT_START) {
             if (!SmapDrivPrivData->SmapIsInitialized) {
@@ -457,14 +461,16 @@ static void IntrHandlerThread(struct SmapDriverData *SmapDrivPrivData)
             dev9IntrEnable(DEV9_SMAP_INTR_MASK2);
 
             // Do the link check, only if there has not been any incoming traffic in a while.
-            if (ResetCounterFlag) {
-                counter = 3;
-                continue;
-            }
-
-            if (EFBits & SMAP_EVENT_LINK_CHECK) {
+            if (ResetCounterFlag)
+                counter = 3; /* ps2xfer: no 'continue', so the accounting below runs */
+            else if (EFBits & SMAP_EVENT_LINK_CHECK) {
                 if (--counter <= 0)
                     CheckLinkStatus(SmapDrivPrivData);
+            }
+        }
+            if (prof_t0) {
+                g_stats.prof_smap16 += (u32)((plat_ticks() - prof_t0) >> 4);
+                g_stats.prof_smap_wakes++;
             }
         }
     }

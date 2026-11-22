@@ -53,13 +53,14 @@ STATUS = {
 CTL = struct.Struct("<BBHII")            # type, flags, status, req_id, session
 DATA = struct.Struct("<BBQIIHH")         # type, flags, offset, pkt_seq, csum, handle, len
 ACK = struct.Struct("<BBHIQQQIIIHH")     # see common/proto.h
-STATS = struct.Struct("<4I8s15I44s64s20I48s")
+STATS = struct.Struct("<4I8s15I44s64s28I48s")
 STATS_FIELDS = (
     "version flags uptime_ms ip mac port link_mode speed_rev dma_block iop_free iop_maxfree "
     "nbuf bufsize cpu_load_x10 udma_mode disk_sectors_lo disk_sectors_hi fs_total_mb fs_free_mb "
     "cluster_size disk_model file file_size_lo file_size_hi written_lo written_hi rx_bytes_lo "
     "rx_bytes_hi rx_pkts rx_dups rx_drops rx_retx rx_errors rx_overruns csum_errors ctl_drops "
-    "acks_sent disk_errors prof_hdr prof_dma prof_total prof_samples last_error").split()
+    "acks_sent disk_errors prof_hdr prof_dma prof_total prof_samples prof_smap16 prof_smap_wakes "
+    "prof_writer16 prof_writer_slots prof_ack16 prof_ack_runs reserved0 reserved1 last_error").split()
 
 CD_LIMIT = 700 * 1024 * 1024
 OPL_NAME_MAX = 160
@@ -802,6 +803,14 @@ def cmd_bench(args):
               f"PS2: rx_errors +{s1['rx_errors'] - s0['rx_errors']}, overruns "
               f"+{s1['rx_overruns'] - s0['rx_overruns']}, drops +{s1['rx_drops'] - s0['rx_drops']}, "
               f"csum errors +{s1['csum_errors'] - s0['csum_errors']}, CPU {s1['cpu_load_x10'] / 10:.1f}%")
+        if s1["prof_smap_wakes"] > s0["prof_smap_wakes"]:
+            npk = max(1, s1["rx_pkts"] - s0["rx_pkts"])
+            d = {k: (s1[k] - s0[k]) & M32 for k in ("prof_smap16", "prof_smap_wakes", "prof_writer16",
+                                                     "prof_writer_slots", "prof_ack16", "prof_ack_runs")}
+            wall = r["seconds"] * 36.864e6
+            print(f"  IOP time per packet (ticks; wall {wall / npk:.0f}): SMAP thread {d['prof_smap16'] * 16 / npk:.0f} "
+                  f"({d['prof_smap_wakes'] / npk:.2f} wake-ups/packet), writer {d['prof_writer16'] * 16 / npk:.0f}, "
+                  f"ack thread {d['prof_ack16'] * 16 / npk:.0f} ({d['prof_ack_runs']} runs)")
         if s1["prof_samples"]:
             print(f"  profile (IOP ticks/packet, 36864 per ms): payload DMA {s1['prof_dma']}, "
                   f"whole RX path {s1['prof_total']} ({s1['prof_samples']} samples; "
