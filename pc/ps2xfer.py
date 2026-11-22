@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import concurrent.futures
 import hashlib
 import itertools
 import mmap
@@ -1116,12 +1117,15 @@ def verify_file(c: Conn, src: str, dst: str):
     nblocks = (size + (1 << 20) - 1) >> 20
     done = 0
     t0 = time.monotonic()
+    # the PC sums its copy in a thread while the PS2 sums the HDD copy
+    pool = concurrent.futures.ThreadPoolExecutor(1)
     while done < nblocks:
         n = min(300, nblocks - done)
+        fut = pool.submit(fletcher_blocks, src, done << 20, n)
         r = c.call(T_BLOCKSUMS, struct.pack("<QI", done << 20, n) + Conn.path(dst), timeout=120.0, retries=2)
         cnt = struct.unpack_from("<I", r)[0]
         remote = list(struct.unpack_from(f"<{cnt}I", r, 4))
-        local = fletcher_blocks(src, done << 20, cnt)
+        local = fut.result()[:cnt]
         for k, (a, b) in enumerate(zip(local, remote)):
             if a != b:
                 raise PxError(f"VERIFY FAILED: {dst} differs in MiB block {done + k}")
