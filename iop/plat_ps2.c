@@ -284,7 +284,7 @@ u32 plat_bench_micro(u32 *vals, u32 n)
    bdmfs_fatfs (as in OPL) owns the volume. */
 int plat_fscheck(char *out, u32 max)
 {
-    static u8 sec[2048] __attribute__((aligned(64)));
+    static u8 sec[2048 + 64] __attribute__((aligned(64)));
     iox_dirent_t de;
     int dfd, fd, n = 0, r;
     u32 len = 0;
@@ -306,10 +306,20 @@ int plat_fscheck(char *out, u32 max)
             len += sprintf(out + len, "%.60s: open %d\n", de.name, fd);
             continue;
         }
-        r = lseek(fd, 16 * 2048, SEEK_SET);
-        n = (r >= 0) ? read(fd, sec, 2048) : r;
-        len += sprintf(out + len, "%.60s: size %u/%u, lseek %d, read %d, %s\n", de.name, de.stat.hisize,
-                       de.stat.size, r, n, (n == 2048 && memcmp(sec + 1, "CD001", 5) == 0) ? "CD001 OK" : "NO CD001");
+        /* sector 16 twice: into a 64-byte aligned buffer and into one that
+           starts 1 byte later (OPL's isofs buffer has no alignment) */
+        {
+            int k, res[2];
+            for (k = 0; k < 2; k++) {
+                u8 *b = sec + k;
+                memset(sec, 0, sizeof(sec));
+                r = lseek(fd, 16 * 2048, SEEK_SET);
+                n = (r >= 0) ? read(fd, b, 2048) : r;
+                res[k] = (n == 2048 && b[0] == 1 && memcmp(b + 1, "CD001", 5) == 0);
+            }
+            len += sprintf(out + len, "%.48s: aligned %s, buffer+1 %s\n", de.name, res[0] ? "CD001 OK" : "BAD",
+                           res[1] ? "CD001 OK" : "BAD");
+        }
         close(fd);
     }
     dclose(dfd);

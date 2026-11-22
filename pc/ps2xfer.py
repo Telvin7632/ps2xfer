@@ -618,6 +618,8 @@ def cmd_send(args):
         if size == 0:
             print(f"skipping empty file {src}")
             continue
+        if not args.keep_name and dst.lower().endswith(".iso"):
+            dst = opl_old_name(dst, local_game_id(src))
         flags = OW_RESUME | (OW_OVERWRITE if args.overwrite else 0)
         label = f"[{i}/{len(files)}] {dst}"
         r = transfer(c, args, src, size, dst, flags, fingerprint(src), label)
@@ -776,6 +778,109 @@ class Downloader:
         self.elapsed = time.perf_counter() - t0
         if not self.quiet:
             sys.stdout.write("\n")
+
+
+OLD_NAME = None  # compiled lazily
+
+
+def is_opl_old_name(name: str) -> bool:
+    """OPL's old ISO naming: SLUS_205.52.Name.iso (game ID taken from the name)."""
+    import re
+    global OLD_NAME
+    if OLD_NAME is None:
+        OLD_NAME = re.compile(r"^[A-Z]{4}_\d{3}\.\d{2}\..+\.(iso|zso)$", re.IGNORECASE)
+    return bool(OLD_NAME.match(name))
+
+
+def iso_game_id(read) -> str | None:
+    """Game ID (e.g. SLUS_205.52) from SYSTEM.CNF of an ISO9660 image.
+    read(offset, length) -> bytes."""
+    pvd = read(16 * 2048, 2048)
+    if pvd[1:6] != b"CD001":
+        return None
+    lba, size = struct.unpack_from("<I", pvd, 158)[0], struct.unpack_from("<I", pvd, 166)[0]
+    data = read(lba * 2048, min(size, 64 * 1024))
+    pos = 0
+    while pos < len(data):
+        ln = data[pos]
+        if ln == 0:
+            pos = (pos // 2048 + 1) * 2048
+            continue
+        nl = data[pos + 32]
+        name = data[pos + 33:pos + 33 + nl].upper()
+        if name.startswith(b"SYSTEM.CNF"):
+            el, es = struct.unpack_from("<I", data, pos + 2)[0], struct.unpack_from("<I", data, pos + 10)[0]
+            cnf = read(el * 2048, min(es, 2048)).decode("ascii", "replace")
+            for line in cnf.splitlines():
+                if line.replace(" ", "").upper().startswith("BOOT2="):
+                    exe = line.split("=", 1)[1].strip().split("\\")[-1].split(":")[-1].split(";")[0]
+                    if len(exe) == 11 and exe[4] == "_" and exe[8] == ".":
+                        return exe.upper()
+            return None
+        pos += ln
+    return None
+
+
+def local_game_id(path: str) -> str | None:
+    if not path.lower().endswith(".iso"):
+        return None
+    with open(path, "rb") as f:
+        def rd(off, n):
+            f.seek(off)
+            return f.read(n)
+        try:
+            return iso_game_id(rd)
+        except (struct.error, IndexError):
+            return None
+
+
+def remote_game_id(c: Conn, path: str) -> str | None:
+    def rd(off, n):
+        buf = bytearray()
+        Downloader(c, path, buf.extend, start=off, size=off + n, quiet=True).run()
+        return bytes(buf)
+    try:
+        return iso_game_id(rd)
+    except (struct.error, IndexError, PxError):
+        return None
+
+
+def opl_old_name(dest: str, gid: str | None) -> str:
+    folder, name = dest.rsplit("/", 1)
+    if gid is None or is_opl_old_name(name):
+        return dest
+    return f"{folder}/{gid}.{name}"
+
+
+def cmd_opl_rename(args):
+    """Renames ISOs in /CD and /DVD to OPL's old format SLUS_205.52.Name.iso.
+    Works around OPL 1.2.0-Beta-2271 not listing new-format ISO names from
+    the internal HDD (BDM ATA) while listing them from USB."""
+    c = connect(args)
+    for folder in ("/CD", "/DVD"):
+        try:
+            r = c.call(T_LIST, struct.pack("<I", 0) + Conn.path(folder))
+        except PxError:
+            continue
+        nxt, count, _ = struct.unpack_from("<IHH", r)
+        pos, names = 8, []
+        for _ in range(count):
+            size, ft, attr, nl = struct.unpack_from("<QIBB", r, pos)
+            names.append(r[pos + 14:pos + 14 + nl].decode("utf-8", "replace"))
+            pos += 14 + nl
+        for n in names:
+            if not n.lower().endswith(".iso") or is_opl_old_name(n):
+                continue
+            gid = remote_game_id(c, f"{folder}/{n}")
+            if gid is None:
+                print(f"  {folder}/{n}: no game ID found, left as is")
+                continue
+            new = f"{folder}/{gid}.{n}"
+            if args.dry_run:
+                print(f"  would rename {folder}/{n} -> {new}")
+            else:
+                c.call(T_RENAME, Conn.path(f"{folder}/{n}") + Conn.path(new))
+                print(f"  {folder}/{n} -> {new}")
 
 
 def cmd_get(args):
@@ -1340,6 +1445,8 @@ def main(argv=None):
     s.add_argument("files", nargs="+")
     s.add_argument("--dest", help="destination path on the PS2 (dir ends with /)")
     s.add_argument("--overwrite", action="store_true")
+    s.add_argument("--keep-name", action="store_true",
+                   help="do not prefix .iso names with the game ID (OPL old naming)")
     s.add_argument("--verify", action="store_true", help="read the file back on the PS2 and compare")
     s.add_argument("--verify-full", action="store_true",
                    help="with --verify: send the file back to the PC and compare SHA-256")
@@ -1350,6 +1457,10 @@ def main(argv=None):
     s.add_argument("remote")
     s.add_argument("--full", action="store_true", help="read the whole file back and compare SHA-256")
     s.set_defaults(func=cmd_verify)
+
+    s = sub.add_parser("opl-rename", help="rename ISOs in /CD and /DVD to SLUS_xxx.xx.Name.iso")
+    s.add_argument("--dry-run", action="store_true")
+    s.set_defaults(func=cmd_opl_rename)
 
     s = sub.add_parser("ftp", help="FTP gateway for Windows Explorer (ftp://127.0.0.1:2121)")
     s.add_argument("--listen", default="127.0.0.1:2121")
