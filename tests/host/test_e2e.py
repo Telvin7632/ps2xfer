@@ -263,16 +263,20 @@ def main():
 
         print("3b. a second client during a transfer must not break it")
         env.start()
-        files["busy.iso"] = mkfile(os.path.join(d, "busy.iso"), 200 << 20, 13)
-        p = env.popen("send", os.path.join(d, "busy.iso"), "--dest", "/DVD/busy.iso", rate=15)
+        files["busy.iso"] = mkfile(os.path.join(d, "busy.iso"), 160 << 20, 13)
+        p = env.popen("send", os.path.join(d, "busy.iso"), "--dest", "/DVD/busy.iso", rate=5)
         time.sleep(2)
         out = env.run("stats")
         assert "busy.iso" in out, out
-        out = env.run("ls", "/", check=False)
+        for _ in range(10):  # more sessions than the PS2 keeps: the sender's must survive
+            out = env.run("ls", "/DVD")
+            assert "busy.iso.part" in out, out
+        assert p.poll() is None, "the transfer ended too early for this test"
+        out = env.run("send", os.path.join(d, "odd.iso"), "--dest", "/DVD/other.iso", check=False)
         assert "another client" in out, out
         out = p.communicate(timeout=120)[0]
         assert p.returncode == 0, out[-2000:]
-        print("    stats allowed, second session refused, transfer finished")
+        print("    stats and ls allowed meanwhile, a second send refused, transfer finished")
         remote["/DVD/busy.iso"] = files["busy.iso"]
         env.kill(signal.SIGTERM)
 

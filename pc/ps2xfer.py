@@ -209,20 +209,10 @@ class Conn:
             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
             self.request(T_PING, addr=("255.255.255.255", self.port), retries=4)
 
-    def hello(self, busy_wait: float = 8.0) -> dict:
+    def hello(self) -> dict:
         body = struct.pack("<III", PROTO_VERSION, random.getrandbits(32), fattime_now())
         self.discover()
-        # the PS2 refuses a new session while a file is still streaming in
-        # from another client (or from us, just before a Ctrl+C)
-        deadline = time.monotonic() + busy_wait
-        while True:
-            st, r = self.request(T_HELLO, body)
-            if st != EBUSY or time.monotonic() > deadline:
-                break
-            time.sleep(0.5)
-        if st == EBUSY:
-            raise PxError("the PS2 is receiving a file from another client; "
-                          "wait until it finishes or stop that client")
+        st, r = self.request(T_HELLO, body)
         if st != 0 or len(r) < 136:
             raise PxError("bad HELLO response")
         f = struct.unpack_from("<III6sH9IQIII", r)
@@ -237,6 +227,23 @@ class Conn:
             raise PxError("unexpected payload size")
         self.info = info
         return info
+
+    def call_unless_busy(self, typ: int, body: bytes = b"", wait: float = 8.0, **kw) -> bytes:
+        """For requests that take over the write slot (RESUME_INFO, OPEN_WRITE):
+        the PS2 answers EBUSY while another client's file is streaming in, and
+        for 2 s after our own sender stopped (Ctrl+C and an immediate restart)."""
+        deadline = time.monotonic() + wait
+        while True:
+            st, r = self.request(typ, body, **kw)
+            if st != EBUSY or time.monotonic() > deadline:
+                break
+            time.sleep(0.5)
+        if st == EBUSY:
+            raise PxError("the PS2 is receiving a file from another client; "
+                          "wait until it finishes or stop that client")
+        if st != 0:
+            raise PxError(status_text(st))
+        return r
 
     def stats(self) -> dict:
         r = self.call(T_STATS)
@@ -557,7 +564,7 @@ def check_resume_tail(c: Conn, src: str, size: int, dest: str, fp: bytes, quiet:
     durable offset with the local file. Returns the resume limit in MiB,
     0 when there is nothing to resume, -1 when the start of the .part is
     already wrong (then the file is sent again from the beginning)."""
-    r = c.call(T_RESUME_INFO, struct.pack("<QII", size, 0, 0) + fp + Conn.path(dest), timeout=30.0)
+    r = c.call_unless_busy(T_RESUME_INFO, struct.pack("<QII", size, 0, 0) + fp + Conn.path(dest), timeout=30.0)
     durable = struct.unpack_from("<Q", r)[0]
     end_mb = durable >> 20
     if end_mb == 0:
@@ -587,7 +594,7 @@ def transfer(c: Conn, args, src_path: str | None, size: int, dest: str | None, f
             flags &= ~OW_RESUME
             limit_mb = 0
     body = struct.pack("<QII", size, flags, limit_mb) + fp + (Conn.path(dest) if dest else b"\0")
-    r = c.call(T_OPEN_WRITE, body, timeout=30.0, retries=3)
+    r = c.call_unless_busy(T_OPEN_WRITE, body, timeout=30.0, retries=3)
     handle, _, start, credit, bufsize, nbuf, lba = struct.unpack_from("<HHQQIIQ", r)
     if start and not args.quiet:
         print(f"resuming at {fmt_size(start)}")
