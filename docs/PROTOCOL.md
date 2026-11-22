@@ -18,6 +18,7 @@ Byte 0 of every UDP payload is the message type:
 | 0x04 | STATS | PC → PS2 |
 | 0x05 | LOG | PC → PS2 |
 | 0x06 | EXIT | PC → PS2 |
+| 0x07 | ANNOUNCE | PS2 → 255.255.255.255:7690, every 2 s while no client is connected |
 | 0x10 | DATA | PC → PS2 |
 | 0x11 | ACK | PS2 → PC |
 | 0x20 | LIST | PC → PS2 |
@@ -182,9 +183,14 @@ are unacknowledged; at least every 20 ms while a transfer is open.
 
 * **Credit:** never send at or beyond `credit`.
 * **Pacing:** bursts of `--burst` packets (2) at times from a high-resolution
-  clock, at `--rate` MB/s. The rate starts at `--rate-start` (9) and grows by
-  0.25 MB/s per second up to `--rate` (11.5). It drops ×0.9 when `rx_errors`
-  or `drops` grow.
+  clock. The rate starts at `--rate-start` (9 MB/s).
+* **Rate control (AIMD on the loss ratio):** every 100 ms the client compares
+  packets detected as lost (below; plus growth of the PS2's `rx_errors` and
+  `drops`) with packets sent in that interval. More than 10 % lost cuts the
+  rate by 20 %. Less than 2 % raises it by 2 % (at least 0.05 MB/s), up to
+  `--rate` (11.5 MB/s). In between, the rate is kept. Heavy loss from
+  overflowing queues (switch, PCSX2, SMAP FIFO) slows the sender; rare random
+  loss does not.
 * **Loss detection (RACK-style):** a sent packet that is not acknowledged
   while `max_pkt_seq ≥ its pkt_seq + 3` is lost and is sent again before new
   data, inside the same pacing budget.
@@ -231,6 +237,10 @@ stored on the disk (the last block zero-padded to 4 bytes).
 * A HELLO sent to 255.255.255.255:7690 is answered by unicast. The client then
   talks to that address. WSL2 in NAT mode does not pass this broadcast; use
   `--host` or mirrored networking.
+* ANNOUNCE (20 bytes: u8 type, 3 × 0, u32 proto, u8 ip[4], u8 mac[6],
+  u16 port) is broadcast from port 7690 every 2 s until a client says HELLO.
+  It also makes PCSX2's *Sockets* network mode bind UDP port 7690 on the host,
+  because PCSX2 only binds ports the PS2 has sent from.
 * The PS2 answers ARP requests for its IP and ICMP echo (ping). It never sends
   ARP requests: replies go to the source MAC of the request.
 * UDP checksums are not checked (Ethernet FCS protects the frame) and are sent

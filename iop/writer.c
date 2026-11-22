@@ -103,6 +103,7 @@ void ack_tick(void)
 {
     rxeng_maybe_ack(0);
     px_load_update();
+    plat_periodic();
 }
 
 void ack_thread(void *arg)

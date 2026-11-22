@@ -250,6 +250,34 @@ static int rx_cb(u16 len, const u8 *hdr, u16 hdr_len)
     return 0;
 }
 
+/* ANNOUNCE broadcast: lets clients see the PS2, and makes PCSX2's "Sockets"
+   network mode bind UDP port 7690 on the host (it only binds ports the PS2
+   has sent from). Payload: u8 type, u8[3] 0, u32 proto, u8 ip[4], u8 mac[6],
+   u16 port (20 bytes). */
+void net_announce(void)
+{
+    u8 body[20];
+    peer_t save;
+    u32 n;
+
+    memset(body, 0, sizeof(body));
+    body[0] = PX_T_ANNOUNCE;
+    wr32(body + 4, PX_PROTO_VERSION);
+    memcpy(body + 8, g_ip, 4);
+    memcpy(body + 12, g_mac, 6);
+    wr16(body + 18, g_port);
+    WaitSema(g_tx_sem);
+    save = g_peer;
+    memset(g_peer.mac, 0xff, 6);
+    memset(g_peer.ip, 0xff, 4);
+    g_peer.port = g_port;
+    n = build_udp_hdr(g_tx, sizeof(body));
+    memcpy(g_tx + n, body, sizeof(body));
+    smap_transmit(g_tx, (u16)(n + sizeof(body)), NULL, 0);
+    g_peer = save;
+    SignalSema(g_tx_sem);
+}
+
 void net_start(void)
 {
     smap_register_rx_callback(rx_cb, 64);

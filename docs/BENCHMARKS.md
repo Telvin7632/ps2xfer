@@ -1,8 +1,40 @@
 # Benchmarks
 
-Status: **Phase 1 tooling ready; no real-PS2 numbers yet.** Speed is measured
-only on a real console (PCSX2 numbers are meaningless). Fill the tables below
-from the commands shown; `ps2xfer.py` prints exactly these values.
+Status: **Phase 1 tooling ready and tested in PCSX2; no real-PS2 numbers yet.**
+Speed is measured only on a real console (PCSX2 timing is not cycle-accurate).
+Fill the tables below from the commands shown; `ps2xfer.py` prints exactly
+these values.
+
+## 0. PCSX2 functional test (2026-11-22)
+
+PCSX2 (Qt, Windows), BIOS SCPH-70012 v12, DEV9 network in **Sockets** mode
+(`ip=192.0.2.100`), HDD image 40 GiB formatted by ps2-exfat-format, client
+`ps2xfer.py` under native Windows Python 3.14 against `127.0.0.1`.
+
+| Check | Result |
+|---|---|
+| Module load, SMAP init, PHY | OK; link 100 Mbit full duplex (from PHYSTS), SPEED rev 0x11 → 128-byte DMA blocks |
+| Disk | IDENTIFY OK (UDMA 4); exFAT mounted, cluster 128 KiB, data at LBA 4096 |
+| IOP memory | max free block before the write buffers 1 251 584 bytes; after 3 × 352 KiB: 285 952 free (largest block 170 240) |
+| info / ls / stat / df / mkdir / mv / rm / ping / log / set | OK |
+| send 50 MiB ISO + `--verify`; send 1 234 567-byte file + `--verify` | OK |
+| client killed at 25.1 MiB, `send` again | resumed at 24.8 MiB, verify OK |
+| bench micro / disk-raw / disk-fatfs / net-sink / net-sink-nodma / combined | all run; bench file removed afterwards |
+| EXIT | PS2 returns to the BIOS browser |
+| HDD image read back by an independent exFAT reader (tests/host/test_e2e.py) | both files SHA-256 identical to the source, NoFatChain (contiguous); no `.part`/`.ps2x`/bench leftovers |
+
+Found and fixed by this test: HELLO parse error in the client; link mode
+taken from ANLPAR (not emulated by PCSX2) instead of PHYSTS; no rate
+reduction on loss that happens before the PS2. PCSX2's Sockets mode drops
+most packets at 9 MB/s, so the first run needed 35 727 retransmits for
+37 237 packets. With loss-ratio rate control (cut above 10 % loss, grow
+below 2 %) the same 50 MiB took 11.8 s (4.45 MB/s) with 1 714 retransmits
+(4.6 %). Thresholds of 5 % / 1.25 % gave 0.7 % retransmits at ~4.0 MB/s but
+collapsed the rate under 5 % random loss in the host tests.
+
+Known PCSX2 difference: its IDENTIFY model string is not byte-swapped per
+the ATA spec, so the screen shows "CPXS-2ED9VA-ATH-DD". Real drives follow
+the spec and are decoded correctly.
 
 Setup to record with every run:
 

@@ -339,6 +339,18 @@ static int InitPHY(struct SmapDriverData *SmapDrivPrivData)
         FlowControlEnabled = SmapConfiguration >> 10 & 1;
     }
 
+    /* ps2xfer: the DP83846A status register holds the speed/duplex actually
+       in use; prefer it (PCSX2 also emulates only this one, not ANLPAR). */
+    {
+        u16 sts = _smap_read_phy(SmapDrivPrivData->emac3_regbase, SMAP_DsPHYTER_PHYSTS);
+        if (sts & SMAP_PHY_STS_LINK) {
+            LinkSpeed100M = (sts & SMAP_PHY_STS_SPDS) ? 0 : 1;
+            LinkFDX       = (sts & SMAP_PHY_STS_DUPS) ? 1 : 0;
+            if (!LinkFDX)
+                FlowControlEnabled = 0;
+        }
+    }
+
     if (LinkSpeed100M)
         result = LinkFDX ? 8 : 4;
     else

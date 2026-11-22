@@ -24,6 +24,7 @@
 #define PX_T_STATS      0x04
 #define PX_T_LOG        0x05
 #define PX_T_EXIT       0x06
+#define PX_T_ANNOUNCE   0x07 /* PS2 -> broadcast, every 2 s while no client is connected */
 
 #define PX_T_DATA       0x10 /* PC -> PS2 */
 #define PX_T_ACK        0x11 /* PS2 -> PC */

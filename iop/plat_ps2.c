@@ -177,6 +177,19 @@ void plat_identify(void)
 
 /* ---------------------------------------------------------------- idle / bench */
 
+void net_announce(void);
+
+void plat_periodic(void)
+{
+    static u32 last;
+    u32 now = px_ms();
+
+    if (!(g_stats.flags & PX_SF_SESSION) && (g_stats.flags & PX_SF_NET_UP) && now - last >= 2000) {
+        last = now;
+        net_announce();
+    }
+}
+
 u32 plat_idle_count(void)
 {
     return g_idle_count;

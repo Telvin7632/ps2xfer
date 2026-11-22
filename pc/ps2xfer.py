@@ -194,7 +194,7 @@ class Conn:
             st, r = self.request(T_HELLO, body)
         if st != 0 or len(r) < 136:
             raise PxError("bad HELLO response")
-        f = struct.unpack_from("<III6sHIIIIIIIIQIII", r)
+        f = struct.unpack_from("<III6sH9IQIII", r)
         info = dict(zip("proto session ip mac port payload unit bufsize nbuf flags link udma "
                         "speed_rev iop_free disk_bytes cluster fs_total_mb fs_free_mb".split(), f))
         info["model"] = r[76:120].split(b"\0")[0].decode(errors="replace")
@@ -301,6 +301,8 @@ class Sender:
         self.rx_errors = None
         self.drops = None
         self.last_rate_up = time.monotonic()
+        self.sent_win = 0
+        self.lost_win = 0
         self.acks = 0
         self.buf = bytearray(DATA.size + PAYLOAD + 4)
         self.bufview = memoryview(self.buf)
@@ -325,6 +327,7 @@ class Sender:
         except (BlockingIOError, OSError):
             pass  # kernel buffer full: treated as a loss, RACK/RTO resend it
         self.inflight.append((self.seq, idx))
+        self.sent_win += 1
         if not retx:
             self.manifest = (self.manifest + ((csum + idx * MANIFEST_MUL) & M32)) & 0xFFFFFFFFFFFFFFFF
         else:
@@ -363,9 +366,9 @@ class Sender:
             self.error = status or 6
         if flags & AF_COMPLETE:
             self.complete = True
-        # rate adaptation on PS2-side errors / drops
+        # PS2-side receive errors / drops count as congestion too
         if self.rx_errors is not None and (rx_err > self.rx_errors or drops > self.drops):
-            self.rate = max(1e6, self.rate * 0.9)
+            self._on_loss((rx_err - self.rx_errors) + (drops - self.drops))
         self.rx_errors, self.drops = rx_err, drops
         self.ps2_rx_errors = rx_err
         # RACK-style loss detection, walking the send-order queue
@@ -377,8 +380,33 @@ class Sender:
             if ((self.max_seen - seq) & M32) < 0x80000000 and ((self.max_seen - seq) & M32) >= 3:
                 self.inflight.popleft()
                 self.retx_q.append(idx)
+                self._on_loss()
                 continue
             break
+
+    # ---- rate control: AIMD on the loss ratio of each 100 ms interval.
+    # Heavy loss (queues overflowing: switch, PCSX2, SMAP FIFO) cuts the rate;
+    # a few random losses only stop it from growing.
+    RATE_MIN = 0.3e6
+    LOSS_CUT = 0.10      # > 10 % lost in an interval: rate x 0.8
+    LOSS_GROW = 0.02     # < 2 %: rate + 2 %
+
+    def _on_loss(self, n: int = 1):
+        self.lost_win += n
+
+    def _rate_tick(self, now: float):
+        if now - self.last_rate_up < 0.1:
+            return
+        self.last_rate_up = now
+        sent, lost = self.sent_win, self.lost_win
+        self.sent_win = self.lost_win = 0
+        if sent == 0:
+            return
+        ratio = lost / sent
+        if ratio > self.LOSS_CUT:
+            self.rate = max(self.RATE_MIN, self.rate * 0.8)
+        elif ratio < self.LOSS_GROW:
+            self.rate = min(self.rate_max, self.rate + max(0.05e6, self.rate * 0.02))
 
     def _poll_acks(self, timeout: float):
         r, _, _ = select.select([self.sock], [], [], timeout)
@@ -444,10 +472,7 @@ class Sender:
             if mono - self.last_ack_time > 15:
                 raise PxError("PS2 does not answer for 15 s (cable? console?); "
                               "run the same send again to resume")
-            # rate increase
-            if mono - self.last_rate_up >= 1.0:
-                self.rate = min(self.rate_max, self.rate + 0.25e6)
-                self.last_rate_up = mono
+            self._rate_tick(mono)
             if not self.quiet and now - last_print >= 0.5:
                 done = min(self.size, self.base_pkt * PAYLOAD)
                 if now - prev_t >= 1.0:
@@ -465,7 +490,7 @@ class Sender:
         eta = (self.size - done) / avg if avg > 0 else 0
         line = (f"\r{self.label} {pct:5.1f}%  {fmt_size(done)}/{fmt_size(self.size)}  "
                 f"{cur / 1e6:5.2f} MB/s (avg {avg / 1e6:5.2f})  ETA {int(eta) // 60}:{int(eta) % 60:02d}  "
-                f"retx {self.retransmits}")
+                f"retx {self.retransmits}  rate {self.rate / 1e6:.1f}")
         sys.stdout.write(line + ("\n" if final else ""))
         sys.stdout.flush()
 
@@ -778,8 +803,9 @@ def cmd_bench(args):
               f"+{s1['rx_overruns'] - s0['rx_overruns']}, drops +{s1['rx_drops'] - s0['rx_drops']}, "
               f"csum errors +{s1['csum_errors'] - s0['csum_errors']}, CPU {s1['cpu_load_x10'] / 10:.1f}%")
         if s1["prof_samples"]:
-            print(f"  profile (ticks/packet): header {s1['prof_hdr']}, payload DMA {s1['prof_dma']}, "
-                  f"total {s1['prof_total']} ({s1['prof_samples']} samples)")
+            print(f"  profile (IOP ticks/packet, 36864 per ms): payload DMA {s1['prof_dma']}, "
+                  f"whole RX path {s1['prof_total']} ({s1['prof_samples']} samples; "
+                  f"includes ~450 ticks of timer calls)")
         return
     raise PxError(f"unknown bench {args.kind}")
 

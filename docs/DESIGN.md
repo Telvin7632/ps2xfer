@@ -13,6 +13,11 @@ and §11–§14, except:
 * `prof_hdr` (header PIO time) is not measured separately; the profile gives
   payload DMA and the whole RX path.
 
+Changes after testing in PCSX2 (2026-11-22): the PS2 broadcasts ANNOUNCE
+every 2 s until a client connects; link mode comes from the PHY status
+register (PHYSTS); the client's rate control is AIMD on the measured loss
+ratio (PROTOCOL.md §5), replacing the fixed ramp of §6.2.
+
 Every statement is tagged as one of:
 
 * **[src]** checked in source code (path given; versions in §1.1);

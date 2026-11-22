@@ -75,6 +75,21 @@ discovery does not work there. Either run the client natively on Windows
 (`py ps2xfer.py ...`), pass `--host`, or enable mirrored networking
 (`networkingMode=mirrored` in `%UserProfile%\.wslconfig`).
 
+## Testing in PCSX2
+
+PCSX2 can run ps2xfer for functional tests (not for speed):
+
+1. Settings → Network & HDD: enable the HDD (an image formatted with
+   ps2-exfat-format) and Ethernet with **Sockets** as the API, device
+   **Auto**. Enable **Host Filesystem** (Settings → Advanced) so the ELF can
+   read `ps2xfer.ini` from its folder.
+2. Put `ps2xfer.ini` with `ip=192.0.2.100` next to `ps2xfer.elf`. In Sockets
+   mode PCSX2 delivers packets to that address.
+3. Start the ELF (System → Start File). PCSX2 binds UDP port 7690 on the PC
+   when the PS2 sends its first ANNOUNCE.
+4. Run the client with **Windows** Python against localhost:
+   `py ps2xfer.py --host 127.0.0.1 info`.
+
 ## Building
 
 Linux or WSL with the PS2DEV toolchain (`PS2DEV`, `PS2SDK` set), `make`,

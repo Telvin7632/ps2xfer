@@ -211,6 +211,8 @@ def main():
                  "folder/a.bin": 3000, "folder/sub/b.bin": 777777}
         for i, (n, size) in enumerate(cases.items()):
             files[n] = mkfile(os.path.join(d, n), size, i)
+        out = env.run("info")
+        assert "exFAT" in out and "buffers" in out, out
         env.run("send", os.path.join(d, "odd.iso"), "--verify")
         env.run("send", os.path.join(d, "tiny.bin"), os.path.join(d, "exact.bin"), "--dest", "/misc", "--verify")
         env.run("send", os.path.join(d, "folder"), "--dest", "/stuff")
@@ -235,6 +237,8 @@ def main():
         remote["/DVD/lossy.iso"] = files["lossy.iso"]
 
         print("3. client interrupted, then resumed")
+        env.kill(signal.SIGTERM)
+        env.start()
         files["big.iso"] = mkfile(os.path.join(d, "big.iso"), 120 << 20, 11)
         p = env.popen("send", os.path.join(d, "big.iso"), "--dest", "/DVD/big.iso", rate=15)
         time.sleep(5)

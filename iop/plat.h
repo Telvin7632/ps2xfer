@@ -53,6 +53,9 @@ int plat_send(const void *hdr, u32 hdr_len, const void *data, u32 data_len);
 #define PX_PEER_SIZE 12
 void plat_set_peer(const void *peer);
 
+/* ---- called every ack_ms from the ack thread (periodic platform work) */
+void plat_periodic(void);
+
 /* ---- CPU load: increments of the idle thread (0 if unsupported) */
 u32 plat_idle_count(void);
 
