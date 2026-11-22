@@ -47,9 +47,13 @@ int px_extent_write(const px_extent_t *e, u64 rel_sector, const void *buf, u32 c
 
         if (g_cfg.wr_boost)
             plat_writer_boost(1);
+        g_stats.wr_lba = (u32)(e->lba + rel_sector);
+        g_stats.wr_phase = (g_stats.wr_phase & ~0xffu) | 0x10; /* waiting for the ATA lock */
         px_ata_lock();
+        g_stats.wr_phase = (g_stats.wr_phase & ~0xffu) | 0x11; /* inside the block device write */
         r = plat_bd_write(e->lba + rel_sector, p, n);
         px_ata_unlock();
+        g_stats.wr_phase = (g_stats.wr_phase & ~0xffu) | 0x12;
         if (g_cfg.wr_boost)
             plat_writer_boost(0);
         if (r != 0)

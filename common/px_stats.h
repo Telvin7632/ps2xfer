@@ -70,7 +70,8 @@ typedef struct px_stats {
     unsigned int prof_smap16, prof_smap_wakes;
     unsigned int prof_writer16, prof_writer_slots;
     unsigned int prof_ack16, prof_ack_runs;
-    unsigned int reserved0, reserved1;
+    unsigned int wr_phase;  /* writer stage (debug): see writer.c; bits 8+: slot states */
+    unsigned int wr_lba;    /* low 32 bits of the LBA being written (debug) */
     char last_error[48];
 } px_stats_t;
 

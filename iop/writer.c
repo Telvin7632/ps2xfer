@@ -85,9 +85,12 @@ void writer_thread(void *arg)
     for (;;) {
         px_slot_t *s;
 
+        g_stats.wr_phase = 1; /* waiting for a full slot */
         plat_sem_wait(g_writer_sem);
         while ((s = take_full_slot()) != NULL) {
             int err = 0;
+
+            g_stats.wr_phase = 2; /* writing a slot */
 
             u64 t0 = g_cfg.prof ? plat_ticks() : 0;
 
@@ -97,16 +100,24 @@ void writer_thread(void *arg)
                 g_stats.prof_writer16 += (u32)((plat_ticks() - t0) >> 4);
                 g_stats.prof_writer_slots++;
             }
+            g_stats.wr_phase = 3; /* finishing */
             finish_slot(s, err);
             plat_sem_signal(g_ack_sem); /* credit changed: ACK now */
+            g_stats.wr_phase = 4; /* checkpoint */
             if (!err)
                 fsops_checkpoint();
+            g_stats.wr_phase = 5;
         }
     }
 }
 
 void ack_tick(void)
 {
+    u32 i, ss = 0;
+
+    for (i = 0; i < g_rx.B && i < 6; i++)
+        ss |= (u32)g_rx.slot[i].state << (8 + 4 * i);
+    g_stats.wr_phase = (g_stats.wr_phase & 0xff) | ss;
     rxeng_maybe_ack(0);
     px_load_update();
     plat_periodic();

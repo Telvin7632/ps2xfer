@@ -7,7 +7,7 @@ IOP_OBJS = main.o net.o smap.o smap_xfer.o plat_ps2.o rpc.o \
            ff.o ffunicode.o imports.o
 
 IOP_OPTFLAGS = -O2
-IOP_CFLAGS  += -Wall -I../common
+IOP_CFLAGS  += -Wall -I../common -MMD -MP  # .d files: header changes rebuild the users
 # 64-bit division helpers (__udivdi3 etc.): FatFs LBA64 and 64-bit offsets
 IOP_LIBS    += -lgcc
 
@@ -18,3 +18,4 @@ clean:
 
 include $(PS2SDK)/samples/Makefile.pref
 include $(PS2SDK)/samples/Makefile.iopglobal
+-include $(wildcard obj/*.d)

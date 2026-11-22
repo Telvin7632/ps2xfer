@@ -65,7 +65,7 @@ STATS_FIELDS = (
     "cluster_size disk_model file file_size_lo file_size_hi written_lo written_hi rx_bytes_lo "
     "rx_bytes_hi rx_pkts rx_dups rx_drops rx_retx rx_errors rx_overruns csum_errors ctl_drops "
     "acks_sent disk_errors prof_hdr prof_dma prof_total prof_samples prof_smap16 prof_smap_wakes "
-    "prof_writer16 prof_writer_slots prof_ack16 prof_ack_runs reserved0 reserved1 last_error").split()
+    "prof_writer16 prof_writer_slots prof_ack16 prof_ack_runs wr_phase wr_lba last_error").split()
 
 CD_LIMIT = 700 * 1024 * 1024
 OPL_NAME_MAX = 160

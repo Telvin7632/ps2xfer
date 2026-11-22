@@ -8,7 +8,7 @@ IRX_C   = $(addsuffix _irx.c,$(IRX_SDK)) ps2xfer_irx.c
 
 EE_OBJS = main.o ui.o $(IRX_C:.c=.o)
 EE_LIBS = -L$(GSKIT)/lib -lgskit_toolkit -lgskit -ldmakit -ldebug -lpad -lpatches -lpoweroff -lelf-loader-nocolour
-EE_CFLAGS += -Wall -I../common
+EE_CFLAGS += -Wall -I../common -MMD -MP  # .d files: header changes rebuild the users
 EE_INCS += -I../common -I$(GSKIT)/include
 
 BIN2C = $(PS2SDK)/bin/bin2c
@@ -25,9 +25,10 @@ main.o: ../common/px_stats.h ../common/proto.h ui.h
 ui.o: ui.h ../common/px_stats.h
 
 clean:
-	rm -f $(EE_BIN) $(EE_OBJS) $(IRX_C)
+	rm -f $(EE_BIN) $(EE_OBJS) $(IRX_C) *.d
 
 .SECONDARY: $(IRX_C)
 
 include $(PS2SDK)/samples/Makefile.pref
 include $(PS2SDK)/samples/Makefile.eeglobal
+-include $(wildcard *.d)
