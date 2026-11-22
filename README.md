@@ -49,7 +49,9 @@ run the same `send` again.
 ```
 python ps2xfer.py --host 192.168.0.10 send "Game (USA).iso"
 python ps2xfer.py send game1.iso game2.zso folder/ --dest /DVD/
-python ps2xfer.py send game.iso --verify      # read back on the PS2 and compare
+python ps2xfer.py send game.iso --verify      # PS2 re-reads the file, compares 1 MiB checksums
+python ps2xfer.py send game.iso --verify --verify-full   # ... or sends it back: SHA-256 on the PC
+python ps2xfer.py get "/DVD/Game.iso" D:\backup\         # copy from the PS2 to the PC
 python ps2xfer.py ls /DVD
 python ps2xfer.py df
 python ps2xfer.py rm /DVD/old.iso
@@ -67,6 +69,23 @@ python ps2xfer.py info | stats | log | ping | exit
 * If the disk has no contiguous free area large enough, the PS2 refuses the
   file ("no contiguous free space"). Free some space (or defragment the disk
   on a PC) and try again.
+
+### Windows Explorer (FTP gateway)
+
+```
+py ps2xfer.py --host 192.168.0.10 ftp
+```
+
+Then open `ftp://127.0.0.1:2121` in Explorer (or *Add a network location*).
+You can browse the PS2 disk and copy files in both directions, rename,
+delete and create folders. Notes:
+
+* the PS2 must be running ps2xfer, and the `ftp` command must stay open;
+* a file copied to the PS2 is first received into a temporary file on the PC
+  (the PS2 needs the size in advance to keep the file in one piece); Explorer
+  reports the copy as done only when the file is on the PS2;
+* empty files cannot be created on the PS2;
+* files cannot be edited in place: copy, edit, copy back.
 
 ### WSL
 

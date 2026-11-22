@@ -125,6 +125,22 @@ int plat_send(const void *hdr, u32 hdr_len, const void *data, u32 data_len)
     return 0;
 }
 
+int plat_send_data(const void *hdr22, const void *data, u32 data_len)
+{
+    static u8 h[64] __attribute__((aligned(64)));
+    u32 wl = (data_len + 3) & ~3u;
+
+    if (wl > 1472 - 22 || ((u32)data & 3))
+        return -1;
+    WaitSema(g_tx_sem);
+    build_udp_hdr(h, 22 + data_len);
+    memcpy(h + 42, hdr22, 22);
+    /* 64-byte header + payload: both 4-aligned, DMA'd straight to the TX FIFO */
+    smap_transmit(h, 64, data, (u16)wl);
+    SignalSema(g_tx_sem);
+    return 0;
+}
+
 static void send_raw(u8 *frame, u32 len)
 {
     WaitSema(g_tx_sem);

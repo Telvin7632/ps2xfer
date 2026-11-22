@@ -158,6 +158,15 @@ int plat_send(const void *hdr, u32 hdr_len, const void *data, u32 data_len)
     return 0;
 }
 
+double g_drop_tx_pct; /* loss injection for READ_DATA (host_main.c --drop-tx) */
+
+int plat_send_data(const void *hdr22, const void *data, u32 data_len)
+{
+    if (g_drop_tx_pct > 0 && (double)rand() / RAND_MAX * 100.0 < g_drop_tx_pct)
+        return 0;
+    return plat_send(hdr22, 22, data, data_len);
+}
+
 void plat_set_peer(const void *peer)
 {
     pthread_mutex_lock(&g_send_mutex);

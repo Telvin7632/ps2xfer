@@ -28,6 +28,7 @@
 
 #define PX_T_DATA       0x10 /* PC -> PS2 */
 #define PX_T_ACK        0x11 /* PS2 -> PC */
+#define PX_T_READ_DATA  0x12 /* PS2 -> PC: file data answering READ (DATA layout) */
 
 #define PX_T_LIST       0x20
 #define PX_T_STAT       0x21
@@ -39,6 +40,8 @@
 #define PX_T_CLOSE      0x27
 #define PX_T_ABORT      0x28
 #define PX_T_BLOCKSUMS  0x29
+#define PX_T_READ       0x2A /* read a file range; data comes as READ_DATA */
+#define PX_READ_MAX     (256 * 1024)
 
 #define PX_T_BENCH      0x30
 

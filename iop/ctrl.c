@@ -263,6 +263,9 @@ static void dispatch(const u8 *req, u32 len)
         case PX_T_BLOCKSUMS:
             status = fsops_blocksums(body, blen, out, &olen);
             break;
+        case PX_T_READ:
+            status = fsops_read(body, blen, rd32(req + 4), out, &olen);
+            break;
         case PX_T_BENCH:
             g_stats.flags |= PX_SF_BENCH;
             status = bench_run(body, blen, out, &olen);

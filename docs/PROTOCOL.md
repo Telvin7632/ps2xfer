@@ -21,6 +21,7 @@ Byte 0 of every UDP payload is the message type:
 | 0x07 | ANNOUNCE | PS2 → 255.255.255.255:7690, every 2 s while no client is connected |
 | 0x10 | DATA | PC → PS2 |
 | 0x11 | ACK | PS2 → PC |
+| 0x12 | READ_DATA | PS2 → PC (answers READ) |
 | 0x20 | LIST | PC → PS2 |
 | 0x21 | STAT | PC → PS2 |
 | 0x22 | MKDIR | PC → PS2 |
@@ -31,6 +32,7 @@ Byte 0 of every UDP payload is the message type:
 | 0x27 | CLOSE | PC → PS2 |
 | 0x28 | ABORT | PC → PS2 |
 | 0x29 | BLOCKSUMS | PC → PS2 |
+| 0x2A | READ | PC → PS2 |
 | 0x30 | BENCH | PC → PS2 |
 
 ## 2. Control requests and responses
@@ -97,6 +99,7 @@ Every type except DATA and ACK uses a 12-byte header:
 | CLOSE | u16 handle, u16 0, u32 0, u64 manifest | u64 PS2 manifest (also with EMISMATCH) |
 | ABORT | u16 handle, u8 delete | – |
 | BLOCKSUMS | u64 offset (multiple of 1 MiB), u32 count, path | u32 n, u32 sum[n] (n ≤ 364) |
+| READ | u64 offset, u32 length (≤ 256 KiB), path | u64 file size, u32 bytes read; the data was sent before as READ_DATA (§6a) |
 | BENCH | u32 kind, u32 size_mb, u32 chunk, u32 flags (bit0: read back) | 112 bytes, see §6 |
 
 HELLO response:
@@ -197,6 +200,18 @@ are unacknowledged; at least every 20 ms while a transfer is open.
 * **Timeout:** no progress for 100 ms (doubling to 1 s): re-send the oldest
   unacknowledged packet. No ACK at all for 15 s: give up (the transfer can be
   resumed).
+
+## 6a. Reading files (READ / READ_DATA)
+
+The PC asks for a range with READ. The PS2 reads it from the disk and sends it
+as READ_DATA packets, then the READ response. READ_DATA has the DATA layout
+(§4): offset = file offset, pkt_seq = the req_id of the READ, csum = 0,
+handle = 0, len ≤ 1408, flag LAST on the final packet; the payload goes from
+the read buffer to the SMAP TX FIFO by DMA. The client keeps 3 READs in
+flight, re-asks contiguous runs of missing packets after the response, and repeats a
+READ that got no answer within 0.25 s. READ is refused (EBUSY) while a transfer
+to the PS2 is open (it uses the write buffers). The PS2 keeps the last file
+open between READs and closes it before DELETE, RENAME and OPEN_WRITE.
 
 ## 6. BENCH
 

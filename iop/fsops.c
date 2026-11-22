@@ -38,6 +38,8 @@ static u8 g_sector[512] __attribute__((aligned(64)));
 
 px_wfile_t g_wfile;
 
+static void read_close(void); /* READ keeps one file open */
+
 DWORD get_fattime(void)
 {
     return g_fattime;
@@ -366,6 +368,7 @@ int fsops_open_write(const u8 *req, u32 len, u8 *resp, u32 *rlen)
     strcat(g_state_name, ".ps2x");
 
     px_fs_lock();
+    read_close();
     if (!(flags & PX_OW_OVERWRITE) && f_stat(g_final, &fno) == FR_OK) {
         px_fs_unlock();
         return PX_EEXIST;
@@ -640,6 +643,7 @@ int fsops_delete(const u8 *req, u32 len)
     if (g_wfile.open && (strcmp(path, g_part_name) == 0 || strcmp(path, g_state_name) == 0))
         return PX_EBUSY;
     px_fs_lock();
+    read_close();
     fr = f_unlink(path);
     px_fs_unlock();
     if (fr == FR_DENIED)
@@ -662,6 +666,7 @@ int fsops_rename(const u8 *req, u32 len)
     if (g_wfile.open && (strcmp(from, g_part_name) == 0 || strcmp(from, g_state_name) == 0))
         return PX_EBUSY;
     px_fs_lock();
+    read_close();
     make_parents(to);
     fr = f_rename(from, to);
     px_fs_unlock();
@@ -748,6 +753,95 @@ int fsops_blocksums(const u8 *req, u32 len, u8 *resp, u32 *rlen)
     wr32(resp, i);
     *rlen = 4 + i * 4;
     return PX_OK;
+}
+
+/* READ: body u64 offset, u32 length (<= PX_READ_MAX), path\0.
+   The data is sent as READ_DATA packets (DATA layout: offset, pkt_seq =
+   req_id, csum 0, handle 0, len; LAST on the final one) before the response:
+   u64 file size, u32 bytes read. Missing packets: the client asks again. */
+static FIL g_rfil;
+static char g_rpath[MAX_PATH];
+static int g_ropen;
+
+int fsops_read(const u8 *req, u32 len, u32 req_id, u8 *resp, u32 *rlen)
+{
+    char path[MAX_PATH];
+    u64 off, fsize = 0;
+    u32 want, got = 0, pos;
+    FRESULT fr = FR_OK;
+    UINT br;
+    u8 h[PX_DATA_HDR] __attribute__((aligned(4)));
+
+    if (len < 13 || get_path(req + 12, len - 12, path) < 0)
+        return PX_EINVAL;
+    if (!g_mounted)
+        return PX_ENODISK;
+    if (g_rx.active || g_bufmem == NULL)
+        return PX_EBUSY; /* the write buffers are the read buffer */
+    off  = rd64(req);
+    want = rd32(req + 8);
+    if (want > PX_READ_MAX)
+        want = PX_READ_MAX;
+    if (want > g_bufmem_size)
+        want = g_bufmem_size - (g_bufmem_size % PX_PAYLOAD);
+
+    px_fs_lock();
+    if (!g_ropen || strcmp(path, g_rpath) != 0) { /* keep the file open between requests */
+        if (g_ropen)
+            f_close(&g_rfil);
+        g_ropen = 0;
+        fr = f_open(&g_rfil, path, FA_READ);
+        if (fr == FR_OK) {
+            g_ropen = 1;
+            strcpy(g_rpath, path);
+        }
+    }
+    if (fr == FR_OK) {
+        fsize = f_size(&g_rfil);
+        if (off < fsize) {
+            if (want > fsize - off)
+                want = (u32)(fsize - off);
+            fr = f_lseek(&g_rfil, off);
+            if (fr == FR_OK)
+                fr = f_read(&g_rfil, g_bufmem, want, &br);
+            if (fr == FR_OK)
+                got = br;
+        }
+    }
+    px_fs_unlock();
+    if (fr != FR_OK) {
+        if (g_ropen)
+            f_close(&g_rfil);
+        g_ropen = 0;
+        return fr2px(fr);
+    }
+
+    for (pos = 0; pos < got; pos += PX_PAYLOAD) {
+        u32 n = got - pos < PX_PAYLOAD ? got - pos : PX_PAYLOAD;
+        if (n & 3)
+            memset(g_bufmem + pos + n, 0, 4 - (n & 3));
+        h[0] = PX_T_READ_DATA;
+        h[1] = (pos + n >= got) ? PX_DF_LAST : 0;
+        wr64(h + 2, off + pos);
+        wr32(h + 10, req_id);
+        wr32(h + 14, 0);
+        wr16(h + 18, 0);
+        wr16(h + 20, (u16)n);
+        plat_send_data(h, g_bufmem + pos, n);
+    }
+    wr64(resp, fsize);
+    wr32(resp + 8, got);
+    *rlen = 12;
+    return PX_OK;
+}
+
+/* closes the file kept open by READ (before writes/deletes touch it) */
+static void read_close(void)
+{
+    if (g_ropen) {
+        f_close(&g_rfil);
+        g_ropen = 0;
+    }
 }
 
 /* ---------------------------------------------------------------- bench helpers */

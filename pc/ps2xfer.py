@@ -30,9 +30,11 @@ WIRE_OVERHEAD = 88          # preamble..IFG + Eth/IP/UDP + our 22-byte header + 
 M32 = 0xFFFFFFFF
 
 T_HELLO, T_PING, T_SET, T_STATS, T_LOG, T_EXIT = 0x01, 0x02, 0x03, 0x04, 0x05, 0x06
-T_DATA, T_ACK = 0x10, 0x11
+T_DATA, T_ACK, T_READ_DATA = 0x10, 0x11, 0x12
 T_LIST, T_STAT, T_MKDIR, T_DELETE, T_RENAME, T_DF = 0x20, 0x21, 0x22, 0x23, 0x24, 0x25
 T_OPEN_WRITE, T_CLOSE, T_ABORT, T_BLOCKSUMS = 0x26, 0x27, 0x28, 0x29
+T_READ = 0x2A
+READ_MAX = 256 * 1024
 T_BENCH = 0x30
 F_RESPONSE = 0x80
 
@@ -612,7 +614,193 @@ def cmd_send(args):
               f"{r['bytes'] / r['seconds'] / 1e6 if r['seconds'] else 0:.2f} MB/s, "
               f"{r['retransmits']} retransmits")
         if args.verify:
-            verify_file(c, src, dst)
+            (verify_file_full if args.verify_full else verify_file)(c, src, dst)
+
+
+# --------------------------------------------------------------- download
+
+class _Req:
+    __slots__ = ("off", "length", "buf", "got", "npk", "responded", "t", "parent", "pidx", "children")
+
+    def __init__(self, off, length, buf, parent=None, pidx=0):
+        self.off, self.length, self.buf = off, length, buf
+        self.npk = (length + PAYLOAD - 1) // PAYLOAD
+        self.got = set()
+        self.responded = False
+        self.t = 0.0
+        self.parent, self.pidx = parent, pidx   # single-packet re-request of parent's packet pidx
+        self.children = 0
+
+
+class Downloader:
+    """Reads a file from the PS2 with READ requests (several in flight). The
+    data arrives as READ_DATA packets; packets still missing after the
+    response are asked for again one by one; a request without any answer
+    for 1 s is sent again."""
+
+    def __init__(self, conn: Conn, path: str, sink, start: int = 0, size: int | None = None,
+                 inflight: int = 3, quiet: bool = False, label: str = ""):
+        self.c, self.path, self.sink = conn, path, sink
+        self.inflight, self.quiet, self.label = inflight, quiet, label
+        self.start, self.size = start, size
+        self.pending: dict[int, _Req] = {}     # req_id -> request on the wire
+        self.waiting: list[_Req] = []          # big requests waiting for their re-requests
+        self.next_off = start
+        self.done_upto = start
+        self.ready: dict[int, bytes] = {}      # finished chunks not yet in order
+        self.rerequests = 0
+        self.elapsed = 0.0
+
+    def _send(self, req: _Req):
+        rid = self.c._next_id()
+        body = struct.pack("<QI", req.off, req.length) + Conn.path(self.path)
+        self.c.sock.sendto(CTL.pack(T_READ, 0, 0, rid, self.c.session) + body, self.c.addr)
+        req.t = time.monotonic()
+        req.responded = False
+        self.pending[rid] = req
+
+    def _fill(self):
+        big = sum(1 for r in self.pending.values() if r.parent is None) + len(self.waiting)
+        while big < self.inflight and self.next_off < self.size:
+            big += 1
+            n = min(READ_MAX, self.size - self.next_off)
+            self._send(_Req(self.next_off, n, bytearray(n)))
+            self.next_off += n
+
+    def _finish(self, req: _Req):
+        if req.parent is not None:              # a re-request: count it in the parent
+            p = req.parent
+            p.got.update(range(req.pidx, req.pidx + req.npk))
+            p.children -= 1
+            if p.children == 0 and len(p.got) == p.npk:
+                self.waiting.remove(p)
+                self._finish(p)
+            return
+        self.ready[req.off] = bytes(req.buf)
+        while self.done_upto in self.ready:
+            b = self.ready.pop(self.done_upto)
+            self.sink(b)
+            self.done_upto += len(b)
+
+    def _on_data(self, rid, off, data):
+        req = self.pending.get(rid)
+        if req is None:
+            return
+        rel = off - req.off
+        if rel < 0 or rel + len(data) > req.length or rel % PAYLOAD:
+            return
+        req.buf[rel:rel + len(data)] = data
+        req.got.add(rel // PAYLOAD)
+        if len(req.got) == req.npk:
+            del self.pending[rid]
+            self._finish(req)
+
+    def _on_response(self, rid):
+        req = self.pending.get(rid)
+        if req is None:
+            return
+        req.responded = True
+        if len(req.got) == req.npk:
+            return
+        if req.parent is not None:
+            # a re-request lost some of its packets: ask for the same run again
+            del self.pending[rid]
+            req.got.clear()
+            self._send(req)
+            self.rerequests += 1
+            return
+        del self.pending[rid]
+        missing = [i for i in range(req.npk) if i not in req.got]
+        runs = []                                  # contiguous runs of missing packets
+        for i in missing:
+            if runs and runs[-1][1] == i:
+                runs[-1][1] = i + 1
+            else:
+                runs.append([i, i + 1])
+        req.children = len(runs)
+        self.waiting.append(req)
+        mv = memoryview(req.buf)
+        for a, b in runs:
+            o = a * PAYLOAD
+            n = min(b * PAYLOAD, req.length) - o
+            self._send(_Req(req.off + o, n, mv[o:o + n], parent=req, pidx=a))
+            self.rerequests += 1
+
+    def run(self) -> None:
+        if self.size is None:
+            st = self.c.call(T_STAT, Conn.path(self.path))
+            self.size = struct.unpack_from("<Q", st)[0]
+        t0 = time.perf_counter()
+        last_print = 0.0
+        self._fill()
+        while self.done_upto < self.size:
+            r, _, _ = select.select([self.c.sock], [], [], 0.05)
+            if r:
+                data, _ = self.c.sock.recvfrom(4096)
+                if len(data) >= DATA.size and data[0] == T_READ_DATA:
+                    _, fl, off, rid, _, _, n = DATA.unpack_from(data)
+                    self._on_data(rid, off, data[DATA.size:DATA.size + n])
+                elif len(data) >= CTL.size and data[0] == T_READ:
+                    t, fl, st, rid, sess = CTL.unpack_from(data)
+                    if fl & F_RESPONSE:
+                        if st != 0 and rid in self.pending:
+                            raise PxError(f"READ failed: {status_text(st)}")
+                        self._on_response(rid)
+            now = time.monotonic()
+            for rid in [k for k, v in self.pending.items() if now - v.t > 0.25]:
+                req = self.pending.pop(rid)
+                self._send(req)               # no answer at all: same range again
+                self.rerequests += 1
+            self._fill()
+            if not self.quiet and time.perf_counter() - last_print >= 0.5:
+                el = time.perf_counter() - t0
+                done = self.done_upto - self.start
+                rate = done / el if el > 0 else 0
+                eta = (self.size - self.done_upto) / rate if rate > 0 else 0
+                sys.stdout.write(f"\r{self.label} {100 * self.done_upto / max(1, self.size):5.1f}%  "
+                                 f"{fmt_size(self.done_upto)}/{fmt_size(self.size)}  {rate / 1e6:5.2f} MB/s  "
+                                 f"ETA {int(eta) // 60}:{int(eta) % 60:02d}  re-requests {self.rerequests}")
+                sys.stdout.flush()
+                last_print = time.perf_counter()
+        self.elapsed = time.perf_counter() - t0
+        if not self.quiet:
+            sys.stdout.write("\n")
+
+
+def cmd_get(args):
+    c = connect(args)
+    st = c.call(T_STAT, Conn.path(args.remote))
+    size, _, attr, _ = struct.unpack_from("<QIBB", st)
+    if attr & 0x10:
+        raise PxError("that is a directory")
+    local = args.local or os.path.basename(args.remote)
+    if os.path.isdir(local):
+        local = os.path.join(local, os.path.basename(args.remote))
+    with open(local + ".part", "wb") as f:
+        d = Downloader(c, args.remote, f.write, size=size, label=os.path.basename(args.remote))
+        d.run()
+    os.replace(local + ".part", local)
+    print(f"    {fmt_size(size)} in {d.elapsed:.1f} s = {size / d.elapsed / 1e6 if d.elapsed else 0:.2f} MB/s, "
+          f"{d.rerequests} re-requests -> {local}")
+
+
+def verify_file_full(c: Conn, src: str, dst: str):
+    """reads the whole file back from the PS2 and compares SHA-256"""
+    size = os.path.getsize(src)
+    h = hashlib.sha256()
+    d = Downloader(c, dst, h.update, size=size, label="    verify (read back)")
+    d.run()
+    local = hashlib.sha256()
+    with open(src, "rb") as f:
+        while True:
+            b = f.read(8 << 20)
+            if not b:
+                break
+            local.update(b)
+    if h.digest() != local.digest():
+        raise PxError(f"VERIFY FAILED: SHA-256 of {dst} differs from {src}")
+    print(f"    verify OK: SHA-256 {local.hexdigest()[:16]}... identical "
+          f"({size / d.elapsed / 1e6 if d.elapsed else 0:.2f} MB/s read-back)")
 
 
 def verify_file(c: Conn, src: str, dst: str):
@@ -639,7 +827,7 @@ def verify_file(c: Conn, src: str, dst: str):
 
 def cmd_verify(args):
     c = connect(args)
-    verify_file(c, args.local, args.remote)
+    (verify_file_full if args.full else verify_file)(c, args.local, args.remote)
 
 
 def cmd_info(args):
@@ -749,6 +937,250 @@ def cmd_rm(args):
 def cmd_mv(args):
     c = connect(args)
     c.call(T_RENAME, Conn.path(args.src) + Conn.path(args.dst))
+
+
+# --------------------------------------------------------------- FTP gateway (Explorer)
+
+class FtpGateway:
+    """Minimal FTP server on the PC that maps to the PS2: open
+    ftp://127.0.0.1:2121 in Windows Explorer to browse, copy, rename and
+    delete. Passive mode only. Uploads are received into a temp file first
+    (PS2 files are preallocated in one piece, so the size must be known) and
+    the 226 reply comes after the file is on the PS2."""
+
+    MONTHS = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()
+
+    def __init__(self, args):
+        import threading
+        self.args = args
+        self.lock = threading.Lock()
+        self.c = connect(args)
+
+    # ---- PS2 calls (one at a time; re-HELLO if another client took the session)
+    def ps2(self, typ, body=b"", **kw):
+        with self.lock:
+            st, r = self.c.request(typ, body, **kw)
+            if st == 8:
+                self.c.hello()
+                st, r = self.c.request(typ, body, **kw)
+            if st != 0:
+                raise PxError(status_text(st))
+            return r
+
+    def listdir(self, path):
+        out, cursor = [], 0
+        while True:
+            r = self.ps2(T_LIST, struct.pack("<I", cursor) + Conn.path(path))
+            nxt, count, _ = struct.unpack_from("<IHH", r)
+            pos = 8
+            for _ in range(count):
+                size, ft, attr, nl = struct.unpack_from("<QIBB", r, pos)
+                name = r[pos + 14:pos + 14 + nl].decode("utf-8", "replace")
+                pos += 14 + nl
+                out.append((name, size, ft, attr))
+            if nxt == 0:
+                return out
+            cursor = nxt
+
+    def stat(self, path):
+        if path == "/":
+            return (0, 0, 0x10)
+        size, ft, attr, _ = struct.unpack_from("<QIBB", self.ps2(T_STAT, Conn.path(path)))
+        return size, ft, attr
+
+    @staticmethod
+    def fat_tuple(ft):
+        d, t = ft >> 16, ft & 0xFFFF
+        return ((d >> 9) + 1980, max(1, (d >> 5) & 15), max(1, d & 31), t >> 11, (t >> 5) & 63, (t & 31) * 2)
+
+    def list_line(self, name, size, ft, attr):
+        y, mo, da, h, mi, _ = self.fat_tuple(ft)
+        perm = "drwxr-xr-x" if attr & 0x10 else "-rw-r--r--"
+        return f"{perm} 1 ps2 ps2 {size:>13} {self.MONTHS[mo - 1]} {da:2d} {y} {name}"
+
+    # ---- server
+    def serve(self, host, port):
+        import threading
+        ls = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        ls.bind((host, port))
+        ls.listen(4)
+        print(f"FTP gateway to the PS2 on ftp://{host}:{port}/  (Ctrl+C to stop)")
+        print("Open that address in Windows Explorer, or add it as a network location.")
+        while True:
+            cs, addr = ls.accept()
+            threading.Thread(target=self.session, args=(cs,), daemon=True).start()
+
+    def session(self, cs):
+        f = cs.makefile("rb")
+        cwd = "/"
+        pasv = None
+        rnfr = None
+        rest = 0
+
+        def reply(text):
+            cs.sendall((text + "\r\n").encode("utf-8"))
+
+        def norm(arg):
+            import posixpath
+            p = arg if arg.startswith("/") else posixpath.join(cwd, arg)
+            p = posixpath.normpath(p)
+            return "/" if p in (".", "//") else p
+
+        def data_conn():
+            nonlocal pasv
+            if pasv is None:
+                return None
+            pasv.settimeout(15)
+            try:
+                ds, _ = pasv.accept()
+            finally:
+                pasv.close()
+                pasv = None
+            return ds
+
+        reply("220 ps2xfer FTP gateway")
+        try:
+            while True:
+                line = f.readline()
+                if not line:
+                    return
+                line = line.decode("utf-8", "replace").rstrip("\r\n")
+                cmd, _, arg = line.partition(" ")
+                cmd = cmd.upper()
+                try:
+                    if cmd == "USER":
+                        reply("331 any password")
+                    elif cmd == "PASS":
+                        reply("230 logged in")
+                    elif cmd == "SYST":
+                        reply("215 UNIX Type: L8")
+                    elif cmd == "FEAT":
+                        reply("211-Features:\r\n UTF8\r\n SIZE\r\n MDTM\r\n REST STREAM\r\n EPSV\r\n PASV\r\n211 End")
+                    elif cmd == "OPTS":
+                        reply("200 OK")
+                    elif cmd in ("TYPE", "MODE", "STRU", "ALLO", "NOOP"):
+                        reply("200 OK")
+                    elif cmd in ("PWD", "XPWD"):
+                        reply(f'257 "{cwd}"')
+                    elif cmd in ("CWD", "XCWD", "CDUP"):
+                        p = norm(".." if cmd == "CDUP" else arg)
+                        if self.stat(p)[2] & 0x10:
+                            cwd = p
+                            reply("250 OK")
+                        else:
+                            reply("550 not a directory")
+                    elif cmd in ("PASV", "EPSV"):
+                        if pasv:
+                            pasv.close()
+                        pasv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        ip = cs.getsockname()[0]
+                        pasv.bind((ip, 0))
+                        pasv.listen(1)
+                        pp = pasv.getsockname()[1]
+                        if cmd == "EPSV":
+                            reply(f"229 Entering Extended Passive Mode (|||{pp}|)")
+                        else:
+                            reply(f"227 Entering Passive Mode ({ip.replace('.', ',')},{pp >> 8},{pp & 255})")
+                    elif cmd in ("LIST", "NLST", "MLSD"):
+                        args_ = [a for a in arg.split() if not a.startswith("-")]
+                        p = norm(args_[0]) if args_ else cwd
+                        entries = self.listdir(p)
+                        reply("150 listing")
+                        ds = data_conn()
+                        lines = []
+                        for name, size, ft, attr in entries:
+                            if cmd == "NLST":
+                                lines.append(name)
+                            elif cmd == "MLSD":
+                                y, mo, da, h, mi, se = self.fat_tuple(ft)
+                                typ = "dir" if attr & 0x10 else "file"
+                                lines.append(f"type={typ};size={size};modify={y:04d}{mo:02d}{da:02d}{h:02d}{mi:02d}{se:02d}; {name}")
+                            else:
+                                lines.append(self.list_line(name, size, ft, attr))
+                        if ds:
+                            ds.sendall(("".join(l + "\r\n" for l in lines)).encode("utf-8"))
+                            ds.close()
+                        reply("226 done")
+                    elif cmd == "SIZE":
+                        reply(f"213 {self.stat(norm(arg))[0]}")
+                    elif cmd == "MDTM":
+                        y, mo, da, h, mi, se = self.fat_tuple(self.stat(norm(arg))[1])
+                        reply(f"213 {y:04d}{mo:02d}{da:02d}{h:02d}{mi:02d}{se:02d}")
+                    elif cmd == "REST":
+                        rest = int(arg)
+                        reply(f"350 restarting at {rest}")
+                    elif cmd == "RETR":
+                        p = norm(arg)
+                        size = self.stat(p)[0]
+                        reply("150 sending")
+                        ds = data_conn()
+                        with self.lock:
+                            d = Downloader(self.c, p, ds.sendall, start=rest, size=size,
+                                           quiet=self.args.quiet, label=f"get {p}")
+                            d.run()
+                        ds.close()
+                        rest = 0
+                        reply("226 done")
+                    elif cmd == "STOR":
+                        import tempfile
+                        p = norm(arg)
+                        reply("150 receiving")
+                        ds = data_conn()
+                        tf = tempfile.NamedTemporaryFile(prefix="ps2xfer-", delete=False)
+                        try:
+                            while True:
+                                b = ds.recv(1 << 20)
+                                if not b:
+                                    break
+                                tf.write(b)
+                            tf.close()
+                            ds.close()
+                            size = os.path.getsize(tf.name)
+                            if size == 0:
+                                reply("553 empty files are not supported")
+                            else:
+                                with self.lock:
+                                    transfer(self.c, self.args, tf.name, size, p, OW_OVERWRITE,
+                                             fingerprint(tf.name), label=f"put {p}")
+                                reply("226 stored on the PS2")
+                        finally:
+                            tf.close()
+                            os.unlink(tf.name)
+                    elif cmd == "DELE" or cmd in ("RMD", "XRMD"):
+                        self.ps2(T_DELETE, Conn.path(norm(arg)))
+                        reply("250 deleted")
+                    elif cmd in ("MKD", "XMKD"):
+                        p = norm(arg)
+                        self.ps2(T_MKDIR, Conn.path(p))
+                        reply(f'257 "{p}" created')
+                    elif cmd == "RNFR":
+                        rnfr = norm(arg)
+                        self.stat(rnfr)
+                        reply("350 ready")
+                    elif cmd == "RNTO":
+                        if rnfr is None:
+                            reply("503 RNFR first")
+                        else:
+                            self.ps2(T_RENAME, Conn.path(rnfr) + Conn.path(norm(arg)))
+                            rnfr = None
+                            reply("250 renamed")
+                    elif cmd == "QUIT":
+                        reply("221 bye")
+                        return
+                    else:
+                        reply("502 not implemented")
+                except PxError as e:
+                    reply(f"550 {e}")
+        except (ConnectionError, OSError):
+            pass
+        finally:
+            cs.close()
+
+
+def cmd_ftp(args):
+    host, _, port = args.listen.partition(":")
+    FtpGateway(args).serve(host or "127.0.0.1", int(port or 2121))
 
 
 # --------------------------------------------------------------- benches
@@ -871,12 +1303,24 @@ def main(argv=None):
     s.add_argument("--dest", help="destination path on the PS2 (dir ends with /)")
     s.add_argument("--overwrite", action="store_true")
     s.add_argument("--verify", action="store_true", help="read the file back on the PS2 and compare")
+    s.add_argument("--verify-full", action="store_true",
+                   help="with --verify: send the file back to the PC and compare SHA-256")
     s.set_defaults(func=cmd_send)
 
     s = sub.add_parser("verify", help="compare a local file with one on the PS2")
     s.add_argument("local")
     s.add_argument("remote")
+    s.add_argument("--full", action="store_true", help="read the whole file back and compare SHA-256")
     s.set_defaults(func=cmd_verify)
+
+    s = sub.add_parser("ftp", help="FTP gateway for Windows Explorer (ftp://127.0.0.1:2121)")
+    s.add_argument("--listen", default="127.0.0.1:2121")
+    s.set_defaults(func=cmd_ftp)
+
+    s = sub.add_parser("get", help="copy a file from the PS2 to the PC")
+    s.add_argument("remote")
+    s.add_argument("local", nargs="?")
+    s.set_defaults(func=cmd_get)
 
     sub.add_parser("info").set_defaults(func=cmd_info)
     s = sub.add_parser("ping")

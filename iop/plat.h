@@ -51,6 +51,9 @@ int plat_send(const void *hdr, u32 hdr_len, const void *data, u32 data_len);
 /* peer = sender of a control request (MAC, IP, UDP port), recorded by the RX
    path; plat_send() always goes to the last peer set here. */
 #define PX_PEER_SIZE 12
+/* bulk send to the current peer: 22-byte protocol header + 4-aligned data
+   (IOP: header and data go to the TX FIFO by DMA, data is not copied) */
+int plat_send_data(const void *hdr22, const void *data, u32 data_len);
 void plat_set_peer(const void *peer);
 
 /* ---- called every ack_ms from the ack thread (periodic platform work) */

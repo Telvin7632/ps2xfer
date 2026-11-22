@@ -178,6 +178,7 @@ int fsops_open_write(const u8 *req, u32 len, u8 *resp, u32 *rlen);
 int fsops_close(const u8 *req, u32 len, u8 *resp, u32 *rlen);
 int fsops_abort(const u8 *req, u32 len);
 int fsops_blocksums(const u8 *req, u32 len, u8 *resp, u32 *rlen);
+int fsops_read(const u8 *req, u32 len, u32 req_id, u8 *resp, u32 *rlen);
 /* writer helpers */
 int fsops_write_slot(px_slot_t *s);   /* 0 or PX_E* */
 void fsops_set_time(u32 fattime);

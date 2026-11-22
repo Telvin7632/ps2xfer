@@ -236,6 +236,17 @@ def main():
         assert "retransmits" in out
         remote["/DVD/lossy.iso"] = files["lossy.iso"]
 
+        print("2b. read back (get) and full SHA-256 verify with 5% loss on the way back")
+        env.kill(signal.SIGTERM)
+        env.start("--drop-tx", "5")
+        back = os.path.join(tmp, "back.iso")
+        out = env.run("get", "/DVD/lossy.iso", back)
+        assert "re-requests" in out, out
+        assert open(back, "rb").read() == open(os.path.join(d, "lossy.iso"), "rb").read(), "get: content differs"
+        out = env.run("verify", "--full", os.path.join(d, "lossy.iso"), "/DVD/lossy.iso")
+        assert "verify OK" in out, out
+        print("    " + [l for l in out.splitlines() if "verify OK" in l][0].strip())
+
         print("3. client interrupted, then resumed")
         env.kill(signal.SIGTERM)
         env.start()

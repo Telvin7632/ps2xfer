@@ -7,7 +7,8 @@
  *               [--disk-mbps N] [--maxfree BYTES] [key=value ...]
  *
  * --mkfs creates IMG (sparse) as MBR + exFAT, like ps2-exfat-format.
- * --drop drops that percentage of incoming DATA packets (loss injection).
+ * --drop drops that percentage of incoming DATA packets (loss injection),
+ * --drop-tx that percentage of outgoing READ_DATA packets.
  */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
@@ -94,6 +95,8 @@ int main(int argc, char **argv)
             g_cfg.port = (u32)atoi(argv[++i]);
         else if (strcmp(argv[i], "--drop") == 0 && i + 1 < argc)
             g_drop_pct = atof(argv[++i]);
+        else if (strcmp(argv[i], "--drop-tx") == 0 && i + 1 < argc)
+            g_drop_tx_pct = atof(argv[++i]);
         else if (strcmp(argv[i], "--disk-mbps") == 0 && i + 1 < argc)
             g_disk_mbps = (u32)atoi(argv[++i]);
         else if (strcmp(argv[i], "--maxfree") == 0 && i + 1 < argc)
