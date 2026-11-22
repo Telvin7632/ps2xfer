@@ -35,6 +35,7 @@ T_LIST, T_STAT, T_MKDIR, T_DELETE, T_RENAME, T_DF = 0x20, 0x21, 0x22, 0x23, 0x24
 T_OPEN_WRITE, T_CLOSE, T_ABORT, T_BLOCKSUMS = 0x26, 0x27, 0x28, 0x29
 T_READ = 0x2A
 T_DISKINFO = 0x2B
+T_RESUME_INFO = 0x2C
 READ_MAX = 256 * 1024
 T_BENCH = 0x30
 F_RESPONSE = 0x80
@@ -71,6 +72,17 @@ OPL_NAME_MAX = 160
 
 class PxError(Exception):
     pass
+
+
+# GUI hooks: progress callback (label, done, size, cur_Bps, avg_Bps, eta_s, retx)
+# replaces the console progress line; CANCEL aborts the running operation.
+PROGRESS_HOOK = None
+CANCEL = None   # threading.Event, set by the GUI
+
+
+def _check_cancel():
+    if CANCEL is not None and CANCEL.is_set():
+        raise PxError("cancelled")
 
 
 def status_text(st: int) -> str:
@@ -444,6 +456,7 @@ class Sender:
         prev_bytes, prev_t = self.start, t0
         cur_rate = 0.0
         while not self.complete:
+            _check_cancel()
             if self.error:
                 raise PxError(f"PS2 stopped the transfer: {status_text(self.error)}")
             now = time.perf_counter()
@@ -497,6 +510,9 @@ class Sender:
         avg = (done - self.start) / elapsed if elapsed > 0 else 0
         pct = 100.0 * done / self.size if self.size else 100.0
         eta = (self.size - done) / avg if avg > 0 else 0
+        if PROGRESS_HOOK is not None:
+            PROGRESS_HOOK(self.label, done, self.size, cur, avg, eta, self.retransmits)
+            return
         line = (f"\r{self.label} {pct:5.1f}%  {fmt_size(done)}/{fmt_size(self.size)}  "
                 f"{cur / 1e6:5.2f} MB/s (avg {avg / 1e6:5.2f})  ETA {int(eta) // 60}:{int(eta) % 60:02d}  "
                 f"retx {self.retransmits}  rate {self.rate / 1e6:.1f}")
@@ -513,9 +529,44 @@ def fingerprint(path: str) -> bytes:
     return h.digest()
 
 
+RESUME_CHECK_MB = 32
+
+
+def check_resume_tail(c: Conn, src: str, size: int, dest: str, fp: bytes, quiet: bool) -> int:
+    """Before resuming: compares the last (up to 32) whole MiB below the PS2's
+    durable offset with the local file. Returns the resume limit in MiB,
+    0 when there is nothing to resume, -1 when the start of the .part is
+    already wrong (then the file is sent again from the beginning)."""
+    r = c.call(T_RESUME_INFO, struct.pack("<QII", size, 0, 0) + fp + Conn.path(dest), timeout=30.0)
+    durable = struct.unpack_from("<Q", r)[0]
+    end_mb = durable >> 20
+    if end_mb == 0:
+        return 0
+    first_mb = max(0, end_mb - RESUME_CHECK_MB)
+    rr = c.call(T_BLOCKSUMS, struct.pack("<QI", first_mb << 20, end_mb - first_mb) + Conn.path(dest + ".part"),
+                timeout=120.0, retries=2)
+    cnt = struct.unpack_from("<I", rr)[0]
+    remote = struct.unpack_from(f"<{cnt}I", rr, 4)
+    local = fletcher_blocks(src, first_mb << 20, cnt)
+    for k, (a, b) in enumerate(zip(local, remote)):
+        if a != b:
+            if not quiet:
+                print(f"resume check: MiB block {first_mb + k} differs, resuming from there")
+            return first_mb + k if first_mb + k > 0 else -1
+    if not quiet:
+        print(f"resume check: last {cnt} MiB before {fmt_size(durable)} match")
+    return end_mb
+
+
 def transfer(c: Conn, args, src_path: str | None, size: int, dest: str | None, flags: int,
              fp: bytes = b"\0" * 32, label: str = "") -> dict:
-    body = struct.pack("<QII", size, flags, 0) + fp + (Conn.path(dest) if dest else b"\0")
+    limit_mb = 0
+    if flags & OW_RESUME and src_path and dest:
+        limit_mb = check_resume_tail(c, src_path, size, dest, fp, args.quiet)
+        if limit_mb < 0:
+            flags &= ~OW_RESUME
+            limit_mb = 0
+    body = struct.pack("<QII", size, flags, limit_mb) + fp + (Conn.path(dest) if dest else b"\0")
     r = c.call(T_OPEN_WRITE, body, timeout=30.0, retries=3)
     handle, _, start, credit, bufsize, nbuf, lba = struct.unpack_from("<HHQQIIQ", r)
     if start and not args.quiet:
@@ -532,8 +583,8 @@ def transfer(c: Conn, args, src_path: str | None, size: int, dest: str | None, f
             if len(r) >= 8:
                 extra = f" (PC manifest {s.manifest:#x}, PS2 {struct.unpack_from('<Q', r)[0]:#x})"
             raise PxError(f"CLOSE failed: {status_text(st)}{extra}")
-    except KeyboardInterrupt:
-        try:
+    except (KeyboardInterrupt, PxError):
+        try:   # keep NAME.part: the next send of the same file resumes it
             c.request(T_ABORT, struct.pack("<HB", handle, 0), retries=2)
         except PxError:
             pass
@@ -607,180 +658,39 @@ def plan_files(paths: list[str], dest: str | None) -> list[tuple[str, str, int]]
     return out
 
 
-def cmd_send(args):
-    files = plan_files(args.files, args.dest)
-    total = sum(f[2] for f in files)
-    c = connect(args)
-    print(f"{len(files)} file(s), {fmt_size(total)}")
+def send_planned(c: Conn, args, files: list[tuple[str, str, int]], log=print) -> None:
+    """Sends planned files (see plan_files): OPL names, verify, art."""
     for i, (src, dst, size) in enumerate(files, 1):
+        _check_cancel()
         for w in opl_warnings(dst):
-            print(f"WARNING {dst}: {w}")
+            log(f"WARNING {dst}: {w}")
         if size == 0:
-            print(f"skipping empty file {src}")
+            log(f"skipping empty file {src}")
             continue
         if not args.keep_name and dst.lower().endswith(".iso"):
             dst = opl_old_name(dst, local_game_id(src))
         flags = OW_RESUME | (OW_OVERWRITE if args.overwrite else 0)
         label = f"[{i}/{len(files)}] {dst}"
         r = transfer(c, args, src, size, dst, flags, fingerprint(src), label)
-        print(f"    {fmt_size(r['bytes'])} in {r['seconds']:.1f} s = "
-              f"{r['bytes'] / r['seconds'] / 1e6 if r['seconds'] else 0:.2f} MB/s, "
-              f"{r['retransmits']} retransmits")
+        log(f"    {dst}: {fmt_size(r['bytes'])} in {r['seconds']:.1f} s = "
+            f"{r['bytes'] / r['seconds'] / 1e6 if r['seconds'] else 0:.2f} MB/s, "
+            f"{r['retransmits']} retransmits")
         if args.verify:
             (verify_file_full if args.verify_full else verify_file)(c, src, dst)
+        if not args.no_art and dst.lower().endswith((".iso", ".zso")):
+            name = dst.rsplit("/", 1)[-1]
+            gid = name[:11].upper() if is_opl_old_name(name) else local_game_id(src)
+            if gid:
+                got = art_for_game(c, args, gid)
+                log(f"    art: {', '.join(got) if got else 'none found / already there'}")
 
 
-# --------------------------------------------------------------- download
-
-class _Req:
-    __slots__ = ("off", "length", "buf", "got", "npk", "responded", "t", "parent", "pidx", "children")
-
-    def __init__(self, off, length, buf, parent=None, pidx=0):
-        self.off, self.length, self.buf = off, length, buf
-        self.npk = (length + PAYLOAD - 1) // PAYLOAD
-        self.got = set()
-        self.responded = False
-        self.t = 0.0
-        self.parent, self.pidx = parent, pidx   # single-packet re-request of parent's packet pidx
-        self.children = 0
-
-
-class Downloader:
-    """Reads a file from the PS2 with READ requests (several in flight). The
-    data arrives as READ_DATA packets; packets still missing after the
-    response are asked for again one by one; a request without any answer
-    for 1 s is sent again."""
-
-    def __init__(self, conn: Conn, path: str, sink, start: int = 0, size: int | None = None,
-                 inflight: int = 3, quiet: bool = False, label: str = ""):
-        self.c, self.path, self.sink = conn, path, sink
-        self.inflight, self.quiet, self.label = inflight, quiet, label
-        self.start, self.size = start, size
-        self.pending: dict[int, _Req] = {}     # req_id -> request on the wire
-        self.waiting: list[_Req] = []          # big requests waiting for their re-requests
-        self.next_off = start
-        self.done_upto = start
-        self.ready: dict[int, bytes] = {}      # finished chunks not yet in order
-        self.rerequests = 0
-        self.elapsed = 0.0
-
-    def _send(self, req: _Req):
-        rid = self.c._next_id()
-        body = struct.pack("<QI", req.off, req.length) + Conn.path(self.path)
-        self.c.sock.sendto(CTL.pack(T_READ, 0, 0, rid, self.c.session) + body, self.c.addr)
-        req.t = time.monotonic()
-        req.responded = False
-        self.pending[rid] = req
-
-    def _fill(self):
-        big = sum(1 for r in self.pending.values() if r.parent is None) + len(self.waiting)
-        while big < self.inflight and self.next_off < self.size:
-            big += 1
-            n = min(READ_MAX, self.size - self.next_off)
-            self._send(_Req(self.next_off, n, bytearray(n)))
-            self.next_off += n
-
-    def _finish(self, req: _Req):
-        if req.parent is not None:              # a re-request: count it in the parent
-            p = req.parent
-            p.got.update(range(req.pidx, req.pidx + req.npk))
-            p.children -= 1
-            if p.children == 0 and len(p.got) == p.npk:
-                self.waiting.remove(p)
-                self._finish(p)
-            return
-        self.ready[req.off] = bytes(req.buf)
-        while self.done_upto in self.ready:
-            b = self.ready.pop(self.done_upto)
-            self.sink(b)
-            self.done_upto += len(b)
-
-    def _on_data(self, rid, off, data):
-        req = self.pending.get(rid)
-        if req is None:
-            return
-        rel = off - req.off
-        if rel < 0 or rel + len(data) > req.length or rel % PAYLOAD:
-            return
-        req.buf[rel:rel + len(data)] = data
-        req.got.add(rel // PAYLOAD)
-        if len(req.got) == req.npk:
-            del self.pending[rid]
-            self._finish(req)
-
-    def _on_response(self, rid):
-        req = self.pending.get(rid)
-        if req is None:
-            return
-        req.responded = True
-        if len(req.got) == req.npk:
-            return
-        if req.parent is not None:
-            # a re-request lost some of its packets: ask for the same run again
-            del self.pending[rid]
-            req.got.clear()
-            self._send(req)
-            self.rerequests += 1
-            return
-        del self.pending[rid]
-        missing = [i for i in range(req.npk) if i not in req.got]
-        runs = []                                  # contiguous runs of missing packets
-        for i in missing:
-            if runs and runs[-1][1] == i:
-                runs[-1][1] = i + 1
-            else:
-                runs.append([i, i + 1])
-        req.children = len(runs)
-        self.waiting.append(req)
-        mv = memoryview(req.buf)
-        for a, b in runs:
-            o = a * PAYLOAD
-            n = min(b * PAYLOAD, req.length) - o
-            self._send(_Req(req.off + o, n, mv[o:o + n], parent=req, pidx=a))
-            self.rerequests += 1
-
-    def run(self) -> None:
-        if self.size is None:
-            st = self.c.call(T_STAT, Conn.path(self.path))
-            self.size = struct.unpack_from("<Q", st)[0]
-        t0 = time.perf_counter()
-        last_print = 0.0
-        self._fill()
-        while self.done_upto < self.size:
-            r, _, _ = select.select([self.c.sock], [], [], 0.05)
-            if r:
-                data, _ = self.c.sock.recvfrom(4096)
-                if len(data) >= DATA.size and data[0] == T_READ_DATA:
-                    _, fl, off, rid, _, _, n = DATA.unpack_from(data)
-                    self._on_data(rid, off, data[DATA.size:DATA.size + n])
-                elif len(data) >= CTL.size and data[0] == T_READ:
-                    t, fl, st, rid, sess = CTL.unpack_from(data)
-                    if fl & F_RESPONSE:
-                        if st != 0 and rid in self.pending:
-                            raise PxError(f"READ failed: {status_text(st)}")
-                        self._on_response(rid)
-            now = time.monotonic()
-            for rid in [k for k, v in self.pending.items() if now - v.t > 0.25]:
-                req = self.pending.pop(rid)
-                self._send(req)               # no answer at all: same range again
-                self.rerequests += 1
-            self._fill()
-            if not self.quiet and time.perf_counter() - last_print >= 0.5:
-                el = time.perf_counter() - t0
-                done = self.done_upto - self.start
-                rate = done / el if el > 0 else 0
-                eta = (self.size - self.done_upto) / rate if rate > 0 else 0
-                sys.stdout.write(f"\r{self.label} {100 * self.done_upto / max(1, self.size):5.1f}%  "
-                                 f"{fmt_size(self.done_upto)}/{fmt_size(self.size)}  {rate / 1e6:5.2f} MB/s  "
-                                 f"ETA {int(eta) // 60}:{int(eta) % 60:02d}  re-requests {self.rerequests}")
-                sys.stdout.flush()
-                last_print = time.perf_counter()
-        self.elapsed = time.perf_counter() - t0
-        if not self.quiet:
-            sys.stdout.write("\n")
-
-
-OLD_NAME = None  # compiled lazily
+def cmd_send(args):
+    files = plan_files(args.files, args.dest)
+    total = sum(f[2] for f in files)
+    c = connect(args)
+    print(f"{len(files)} file(s), {fmt_size(total)}")
+    send_planned(c, args, files)
 
 
 def is_opl_old_name(name: str) -> bool:
@@ -921,64 +831,72 @@ def fetch_art(gid: str, kind: str) -> tuple[bytes, str] | None:
     return None
 
 
+def ps2_listdir(c: Conn, folder: str) -> list[str]:
+    out, cursor = [], 0
+    while True:
+        try:
+            r = c.call(T_LIST, struct.pack("<I", cursor) + Conn.path(folder))
+        except PxError:
+            return out
+        nxt, count, _ = struct.unpack_from("<IHH", r)
+        pos = 8
+        for _ in range(count):
+            _, _, _, nl = struct.unpack_from("<QIBB", r, pos)
+            out.append(r[pos + 14:pos + 14 + nl].decode("utf-8", "replace"))
+            pos += 14 + nl
+        if nxt == 0:
+            return out
+        cursor = nxt
+
+
+def art_for_game(c: Conn, args, gid: str, have: set | None = None, overwrite: bool = False,
+                 log=print) -> list[str]:
+    """Downloads the OPL art of one game into /ART on the PS2; returns the
+    art types stored. `have`: names already in /ART without extension."""
+    import tempfile
+    import shutil
+    if have is None:
+        have = {n.rsplit(".", 1)[0] for n in ps2_listdir(c, "/ART")}
+    tmpdir = tempfile.mkdtemp(prefix="ps2xfer-art-")
+    got = []
+    quiet_args = argparse.Namespace(**{**vars(args), "quiet": True})
+    try:
+        for kind in ART_TYPES:
+            if f"{gid}_{kind}" in have and not overwrite:
+                continue
+            r = fetch_art(gid, kind)
+            if r is None:
+                continue
+            data, ext = r
+            tmp = os.path.join(tmpdir, f"{gid}_{kind}.{ext}")
+            with open(tmp, "wb") as f:
+                f.write(data)
+            transfer(c, quiet_args, tmp, len(data), f"/ART/{gid}_{kind}.{ext}", OW_OVERWRITE)
+            have.add(f"{gid}_{kind}")
+            got.append(kind)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    return got
+
+
 def cmd_art(args):
     """Downloads OPL art (covers, icons, spines, logos, backgrounds,
     screenshots) for the games on the PS2 and stores it in /ART."""
-    import tempfile
     c = connect(args)
-
-    def listdir(folder):
-        out, cursor = [], 0
-        while True:
-            try:
-                r = c.call(T_LIST, struct.pack("<I", cursor) + Conn.path(folder))
-            except PxError:
-                return out
-            nxt, count, _ = struct.unpack_from("<IHH", r)
-            pos = 8
-            for _ in range(count):
-                _, _, _, nl = struct.unpack_from("<QIBB", r, pos)
-                out.append(r[pos + 14:pos + 14 + nl].decode("utf-8", "replace"))
-                pos += 14 + nl
-            if nxt == 0:
-                return out
-            cursor = nxt
-
-    have = {n.rsplit(".", 1)[0] for n in listdir("/ART")}
-    games = []
+    have = {n.rsplit(".", 1)[0] for n in ps2_listdir(c, "/ART")}
+    total = 0
     for folder in ("/CD", "/DVD"):
-        for n in listdir(folder):
+        for n in ps2_listdir(c, folder):
             if not n.lower().endswith((".iso", ".zso")):
                 continue
             gid = n[:11].upper() if is_opl_old_name(n) else (
                 remote_game_id(c, f"{folder}/{n}") if n.lower().endswith(".iso") else None)
-            if gid:
-                games.append((gid, n))
-            else:
+            if not gid:
                 print(f"  {n}: no game ID, skipped")
-    tmpdir = tempfile.mkdtemp(prefix="ps2xfer-art-")
-    total = 0
-    try:
-        for gid, n in games:
-            got = []
-            for kind in ART_TYPES:
-                if f"{gid}_{kind}" in have and not args.overwrite:
-                    continue
-                r = fetch_art(gid, kind)
-                if r is None:
-                    continue
-                data, ext = r
-                tmp = os.path.join(tmpdir, f"{gid}_{kind}.{ext}")
-                with open(tmp, "wb") as f:
-                    f.write(data)
-                transfer(c, args, tmp, len(data), f"/ART/{gid}_{kind}.{ext}", OW_OVERWRITE,
-                         label=f"{gid}_{kind}")
-                got.append(kind)
-                total += 1
+                continue
+            got = art_for_game(c, args, gid, have, args.overwrite)
+            total += len(got)
             print(f"  {gid} {n}: {', '.join(got) if got else 'nothing new'}")
-    finally:
-        import shutil
-        shutil.rmtree(tmpdir, ignore_errors=True)
     print(f"{total} art file(s) stored in /ART")
 
 
@@ -1527,6 +1445,336 @@ def bench_selftest(args):
     print(f"  line rate needs {need} packets/s: {'OK' if n / dt > need * 2 else 'TOO SLOW for comfortable pacing'}")
 
 
+# --------------------------------------------------------------- GUI (tkinter)
+
+def cmd_gui(args):
+    """Window for everyday use: list, send (queue), delete, rename, copy to
+    the PC, art, with progress. All PS2 work runs on one worker thread."""
+    import json
+    import queue
+    import threading
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, simpledialog, ttk
+
+    global PROGRESS_HOOK, CANCEL
+    CANCEL = threading.Event()
+    cfg_path = os.path.join(os.path.expanduser("~"), ".ps2xfer.json")
+    try:
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        cfg = {}
+
+    root = tk.Tk()
+    root.title(f"ps2xfer {VERSION}")
+    root.geometry("900x620")
+    ui_q: "queue.Queue" = queue.Queue()      # callables to run on the UI thread
+    work_q: "queue.Queue" = queue.Queue()    # (description, callable) for the worker
+    state = {"conn": None, "folder": "/DVD", "busy": False}
+
+    def ui(fn, *a):
+        ui_q.put(lambda: fn(*a))
+
+    # ---- widgets
+    top = ttk.Frame(root, padding=6)
+    top.pack(fill="x")
+    ttk.Label(top, text="PS2 IP:").pack(side="left")
+    host_var = tk.StringVar(value=args.host or cfg.get("host", ""))
+    ttk.Entry(top, textvariable=host_var, width=16).pack(side="left", padx=4)
+    ttk.Button(top, text="Connect", command=lambda: do_connect()).pack(side="left")
+    status_var = tk.StringVar(value="Not connected (empty IP = find the PS2 by broadcast)")
+    ttk.Label(top, textvariable=status_var).pack(side="left", padx=10)
+
+    mid = ttk.Frame(root, padding=(6, 0))
+    mid.pack(fill="both", expand=True)
+    bar = ttk.Frame(mid)
+    bar.pack(fill="x", pady=4)
+    folder_var = tk.StringVar(value="/DVD")
+    fsel = ttk.Combobox(bar, textvariable=folder_var, values=["/DVD", "/CD", "/ART", "/"], width=8, state="readonly")
+    fsel.pack(side="left")
+    fsel.bind("<<ComboboxSelected>>", lambda e: refresh())
+    for text, cmd in (("Refresh", lambda: refresh()), ("Add games...", lambda: add_files()),
+                      ("Add folder...", lambda: add_folder()), ("Delete", lambda: delete()),
+                      ("Rename", lambda: rename()), ("Copy to PC...", lambda: copy_to_pc()),
+                      ("Download art", lambda: download_art())):
+        ttk.Button(bar, text=text, command=cmd).pack(side="left", padx=2)
+    verify_var = tk.BooleanVar(value=cfg.get("verify", False))
+    art_var = tk.BooleanVar(value=cfg.get("art", True))
+    ttk.Checkbutton(bar, text="Verify", variable=verify_var).pack(side="left", padx=6)
+    ttk.Checkbutton(bar, text="Art", variable=art_var).pack(side="left")
+
+    tree = ttk.Treeview(mid, columns=("id", "size"), selectmode="extended")
+    tree.heading("#0", text="Name")
+    tree.heading("id", text="Game ID")
+    tree.heading("size", text="Size")
+    tree.column("#0", width=560)
+    tree.column("id", width=110)
+    tree.column("size", width=100, anchor="e")
+    tree.pack(fill="both", expand=True)
+
+    bottom = ttk.Frame(root, padding=6)
+    bottom.pack(fill="x")
+    cur_var = tk.StringVar(value="Idle")
+    ttk.Label(bottom, textvariable=cur_var).pack(anchor="w")
+    pbar = ttk.Progressbar(bottom, maximum=1000)
+    pbar.pack(fill="x", pady=2)
+    stat_var = tk.StringVar(value="")
+    row = ttk.Frame(bottom)
+    row.pack(fill="x")
+    ttk.Label(row, textvariable=stat_var).pack(side="left")
+    ttk.Button(row, text="Cancel", command=lambda: CANCEL.set()).pack(side="right")
+    ttk.Button(row, text="Exit ps2xfer on the PS2", command=lambda: exit_ps2()).pack(side="right", padx=4)
+    log_box = tk.Text(root, height=8, state="disabled")
+    log_box.pack(fill="x", padx=6, pady=(0, 6))
+
+    def log(text):
+        def f():
+            log_box.configure(state="normal")
+            log_box.insert("end", text.rstrip("\n") + "\n")
+            log_box.see("end")
+            log_box.configure(state="disabled")
+        ui_q.put(f)
+
+    def progress(label, done, size, cur, avg, eta, retx):
+        def f():
+            cur_var.set(label)
+            pbar["value"] = 1000 * done / size if size else 0
+            e = int(eta)
+            stat_var.set(f"{fmt_size(done)} / {fmt_size(size)}   {cur / 1e6:5.2f} MB/s (avg {avg / 1e6:5.2f})"
+                         f"   ETA {e // 3600}:{e // 60 % 60:02d}:{e % 60:02d}   retransmits {retx}")
+        ui_q.put(f)
+
+    PROGRESS_HOOK = progress
+
+    class LogWriter:
+        """console output -> the log box (progress lines with \\r are dropped)"""
+        def __init__(self):
+            self.buf = ""
+
+        def write(self, text):
+            self.buf += text
+            while "\n" in self.buf:
+                line, self.buf = self.buf.split("\n", 1)
+                line = line.split("\r")[-1]
+                if line.strip():
+                    log(line)
+            if "\r" in self.buf:
+                self.buf = self.buf.split("\r")[-1]
+            return len(text)
+
+        def flush(self):
+            pass
+
+    sys.stdout = LogWriter()
+
+    # ---- worker
+    def worker():
+        while True:
+            desc, fn = work_q.get()
+            CANCEL.clear()
+            state["busy"] = True
+            ui(cur_var.set, desc)
+            try:
+                fn()
+            except PxError as e:
+                log(f"{desc}: {e}")
+            except Exception as e:     # keep the window alive, show what happened
+                log(f"{desc}: {type(e).__name__}: {e}")
+            state["busy"] = False
+            if work_q.empty():
+                ui(cur_var.set, "Idle")
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    def job(desc, fn):
+        work_q.put((desc, fn))
+
+    def conn():
+        if state["conn"] is None:
+            raise PxError("not connected")
+        return state["conn"]
+
+    def run_args(**kw):
+        a = argparse.Namespace(**vars(args))
+        a.quiet = False
+        a.verify = verify_var.get()
+        a.verify_full = False
+        a.no_art = not art_var.get()
+        a.keep_name = False
+        a.overwrite = False
+        for k, v in kw.items():
+            setattr(a, k, v)
+        return a
+
+    # ---- actions
+    def do_connect():
+        h = host_var.get().strip() or None
+
+        def fn():
+            c = Conn(h, args.port)
+            i = c.hello()
+            state["conn"] = c
+            ip = socket.inet_ntoa(struct.pack(">I", i["ip"]))
+            free = "?" if i["fs_free_mb"] == M32 else fmt_size(i["fs_free_mb"] << 20)
+            ui(status_var.set, f"PS2 {ip}: {link_text(i['link'])}, disk {i['model'] or '?'}, free {free}")
+            ui(host_var.set, c.host)
+            cfg["host"] = c.host
+            log(f"connected to {ip} (ps2xfer {i['version']})")
+            list_folder()
+        job("Connecting...", fn)
+
+    def list_folder():
+        folder = folder_var.get()
+        c = conn()
+        items, cursor = [], 0
+        while True:
+            r = c.call(T_LIST, struct.pack("<I", cursor) + Conn.path(folder))
+            nxt, count, _ = struct.unpack_from("<IHH", r)
+            pos = 8
+            for _ in range(count):
+                size, ft, attr, nl = struct.unpack_from("<QIBB", r, pos)
+                items.append((r[pos + 14:pos + 14 + nl].decode("utf-8", "replace"), size, attr))
+                pos += 14 + nl
+            if nxt == 0:
+                break
+            cursor = nxt
+
+        def f():
+            tree.delete(*tree.get_children())
+            for name, size, attr in sorted(items, key=lambda x: x[0].lower()):
+                shown, gid = name, ""
+                if is_opl_old_name(name):
+                    gid, shown = name[:11], name[12:]
+                tree.insert("", "end", iid=name, text=shown + ("/" if attr & 0x10 else ""),
+                            values=(gid, "" if attr & 0x10 else fmt_size(size)))
+        ui_q.put(f)
+
+    def refresh():
+        job("Listing...", list_folder)
+
+    def add_paths(paths):
+        files = plan_files(paths, None)
+        a = run_args()
+        log(f"queued {len(files)} file(s), {fmt_size(sum(x[2] for x in files))}")
+
+        def fn():
+            send_planned(conn(), a, files, log)
+            log("done")
+            list_folder()
+        job(f"Sending {len(files)} file(s)...", fn)
+
+    def add_files():
+        paths = filedialog.askopenfilenames(title="Games or files to send to the PS2",
+                                            filetypes=[("PS2 games", "*.iso *.zso"), ("All files", "*.*")])
+        if paths:
+            add_paths(list(paths))
+
+    def add_folder():
+        d = filedialog.askdirectory(title="Folder: its .iso/.zso go to CD/DVD")
+        if d:
+            add_paths([d])
+
+    def selected():
+        folder = folder_var.get().rstrip("/")
+        return [(n, f"{folder}/{n}") for n in tree.selection()]
+
+    def delete():
+        sel = selected()
+        if not sel or not messagebox.askyesno("Delete", "Delete on the PS2:\n" + "\n".join(n for n, _ in sel)):
+            return
+
+        def fn():
+            for n, pth in sel:
+                conn().call(T_DELETE, Conn.path(pth))
+                log(f"deleted {pth}")
+            list_folder()
+        job("Deleting...", fn)
+
+    def rename():
+        sel = selected()
+        if len(sel) != 1:
+            return
+        n, pth = sel[0]
+        prefix = n[:12] if is_opl_old_name(n) else ""
+        new = simpledialog.askstring("Rename", "New name:", initialvalue=n[len(prefix):])
+        if not new or new == n[len(prefix):]:
+            return
+        dst = pth.rsplit("/", 1)[0] + "/" + prefix + new
+
+        def fn():
+            conn().call(T_RENAME, Conn.path(pth) + Conn.path(dst))
+            log(f"{pth} -> {dst}")
+            list_folder()
+        job("Renaming...", fn)
+
+    def copy_to_pc():
+        sel = selected()
+        if not sel:
+            return
+        d = filedialog.askdirectory(title="Copy to")
+        if not d:
+            return
+
+        def fn():
+            for n, pth in sel:
+                st = conn().call(T_STAT, Conn.path(pth))
+                size = struct.unpack_from("<Q", st)[0]
+                local = os.path.join(d, n[12:] if is_opl_old_name(n) else n)
+                with open(local + ".part", "wb") as f:
+                    Downloader(conn(), pth, f.write, size=size, label=f"copy {n}").run()
+                os.replace(local + ".part", local)
+                log(f"copied {pth} -> {local}")
+        job("Copying to the PC...", fn)
+
+    def download_art():
+        def fn():
+            c = conn()
+            have = {n.rsplit(".", 1)[0] for n in ps2_listdir(c, "/ART")}
+            for folder in ("/CD", "/DVD"):
+                for n in ps2_listdir(c, folder):
+                    _check_cancel()
+                    if not n.lower().endswith((".iso", ".zso")):
+                        continue
+                    gid = n[:11].upper() if is_opl_old_name(n) else (
+                        remote_game_id(c, f"{folder}/{n}") if n.lower().endswith(".iso") else None)
+                    if gid:
+                        got = art_for_game(c, run_args(quiet=True), gid, have)
+                        log(f"{gid}: {', '.join(got) if got else 'nothing new'}")
+            log("art done")
+        job("Downloading art...", fn)
+
+    def exit_ps2():
+        if messagebox.askyesno("Exit", "Leave ps2xfer on the PS2?"):
+            job("Exit", lambda: (conn().call(T_EXIT), log("PS2 is leaving ps2xfer")))
+
+    def pump():
+        try:
+            while True:
+                ui_q.get_nowait()()
+        except queue.Empty:
+            pass
+        root.after(100, pump)
+
+    def on_close():
+        cfg["verify"] = verify_var.get()
+        cfg["art"] = art_var.get()
+        try:
+            with open(cfg_path, "w") as f:
+                json.dump(cfg, f)
+        except OSError:
+            pass
+        if state["busy"] and not messagebox.askyesno("Quit", "A transfer is running. Quit anyway? "
+                                                     "(an interrupted file resumes next time)"):
+            return
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
+    pump()
+    if host_var.get():
+        do_connect()
+    root.mainloop()
+
+
 # --------------------------------------------------------------- main
 
 def main(argv=None):
@@ -1544,6 +1792,7 @@ def main(argv=None):
     s.add_argument("files", nargs="+")
     s.add_argument("--dest", help="destination path on the PS2 (dir ends with /)")
     s.add_argument("--overwrite", action="store_true")
+    s.add_argument("--no-art", action="store_true", help="do not download OPL art for sent games")
     s.add_argument("--keep-name", action="store_true",
                    help="do not prefix .iso names with the game ID (OPL old naming)")
     s.add_argument("--verify", action="store_true", help="read the file back on the PS2 and compare")
@@ -1556,6 +1805,8 @@ def main(argv=None):
     s.add_argument("remote")
     s.add_argument("--full", action="store_true", help="read the whole file back and compare SHA-256")
     s.set_defaults(func=cmd_verify)
+
+    sub.add_parser("gui", help="open the window (also when started without arguments)").set_defaults(func=cmd_gui)
 
     s = sub.add_parser("art", help="download OPL art (covers, icons, backgrounds...) for the games on the PS2")
     s.add_argument("--overwrite", action="store_true")
@@ -1613,6 +1864,8 @@ def main(argv=None):
     s.add_argument("--count", type=int, default=50, help="selftest: thousands of packets")
     s.set_defaults(func=cmd_bench)
 
+    if argv is None and len(sys.argv) == 1:
+        argv = ["gui"]          # double-click / no arguments: the window
     args = p.parse_args(argv)
     try:
         args.func(args)

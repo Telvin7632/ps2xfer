@@ -331,7 +331,7 @@ static void close_part(int write_state)
 /* body: u64 size, u32 flags, u32 reserved, u8 fp[32], path\0 */
 int fsops_open_write(const u8 *req, u32 len, u8 *resp, u32 *rlen)
 {
-    u64 size, start = 0, credit;
+    u64 size, start = 0, credit, resume_limit;
     u32 flags;
     int r = PX_OK, n;
     FRESULT fr;
@@ -341,6 +341,7 @@ int fsops_open_write(const u8 *req, u32 len, u8 *resp, u32 *rlen)
         return PX_EINVAL;
     size  = rd64(req);
     flags = rd32(req + 8);
+    resume_limit = (u64)rd32(req + 12) << 20; /* MiB; 0 = no limit (client checked the tail) */
     if (size == 0)
         return PX_EINVAL;
 
@@ -381,7 +382,10 @@ int fsops_open_write(const u8 *req, u32 len, u8 *resp, u32 *rlen)
         s64 d = state_read(size, g_fp);
         if (d >= 0 && f_open(&g_part, g_part_name, FA_OPEN_EXISTING | FA_WRITE) == FR_OK) {
             if (file_extent(&g_part, size, &g_wfile.ext) == 0) {
-                start = (u64)d - ((u64)d % g_rx.S);
+                start = (u64)d;
+                if (resume_limit != 0 && start > resume_limit)
+                    start = resume_limit;
+                start -= start % g_rx.S;
                 g_wfile.open = 1;
                 px_log("resume %s at %u MiB\n", g_final, (unsigned)(start >> 20));
             } else {
@@ -779,6 +783,38 @@ int fsops_diskinfo(u8 *resp, u32 *rlen)
     px_fs_unlock();
     *rlen = 1040;
     return r == 0 ? PX_OK : PX_EIO;
+}
+
+/* RESUME_INFO: body u64 size, u32 0, u32 0, u8 fp[32], path\0 ->
+   u64 durable offset of path.part (0 = nothing to resume), u64 0.
+   An open transfer is closed resumably first, so BLOCKSUMS can read
+   path.part afterwards. */
+int fsops_resume_info(const u8 *req, u32 len, u8 *resp, u32 *rlen)
+{
+    char path[MAX_PATH];
+    FILINFO fno;
+    s64 d = -1;
+    u64 size;
+
+    if (len < 49 || get_path(req + 48, len - 48, path) < 0 || strlen(path) + 6 > MAX_PATH)
+        return PX_EINVAL;
+    if (!g_mounted)
+        return PX_ENODISK;
+    if (g_rx.active || g_wfile.open)
+        close_part(1);
+    size = rd64(req);
+    strcpy(g_part_name, path);
+    strcat(g_part_name, ".part");
+    strcpy(g_state_name, path);
+    strcat(g_state_name, ".ps2x");
+    px_fs_lock();
+    if (f_stat(g_part_name, &fno) == FR_OK && fno.fsize == size && state_open(0) == PX_OK)
+        d = state_read(size, req + 16);
+    px_fs_unlock();
+    wr64(resp, d > 0 ? (u64)d : 0);
+    wr64(resp + 8, 0);
+    *rlen = 16;
+    return PX_OK;
 }
 
 /* READ: body u64 offset, u32 length (<= PX_READ_MAX), path\0.

@@ -48,6 +48,18 @@ run the same `send` again.
 
 ## On the PC
 
+### Window
+
+Double-click `ps2xfer.py` (or `py ps2xfer.py gui`). Enter the PS2's IP (or
+leave it empty to find it by broadcast) and press **Connect**. Then:
+**Add games...** / **Add folder...** send ISO/ZSO files (they go to `CD/` or
+`DVD/`, get OPL names and art automatically), **Delete**, **Rename**,
+**Copy to PC...**, **Download art**, **Exit ps2xfer on the PS2**. The bottom
+shows progress, speed and ETA; **Cancel** stops the current transfer (it
+resumes when the file is sent again). Settings are kept in `~/.ps2xfer.json`.
+
+### Command line
+
 ```
 python ps2xfer.py --host 192.168.0.10 send "Game (USA).iso"
 python ps2xfer.py send game1.iso game2.zso --dest /DVD/
@@ -60,7 +72,7 @@ python ps2xfer.py ls /DVD
 python ps2xfer.py df
 python ps2xfer.py rm /DVD/old.iso
 python ps2xfer.py mv /DVD/a.iso /DVD/b.iso
-python ps2xfer.py art                         # covers, icons, backgrounds... for OPL into /ART
+python ps2xfer.py art                         # art for games already on the PS2 (send does it itself)
 python ps2xfer.py opl-rename                  # SLUS_xxx.xx.Name.iso names (see below)
 python ps2xfer.py info | stats | log | ping | exit
 ```

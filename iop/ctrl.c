@@ -263,6 +263,9 @@ static void dispatch(const u8 *req, u32 len)
         case PX_T_BLOCKSUMS:
             status = fsops_blocksums(body, blen, out, &olen);
             break;
+        case PX_T_RESUME_INFO:
+            status = fsops_resume_info(body, blen, out, &olen);
+            break;
         case PX_T_DISKINFO:
             status = fsops_diskinfo(out, &olen);
             break;

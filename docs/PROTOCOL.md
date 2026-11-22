@@ -33,6 +33,8 @@ Byte 0 of every UDP payload is the message type:
 | 0x28 | ABORT | PC → PS2 |
 | 0x29 | BLOCKSUMS | PC → PS2 |
 | 0x2A | READ | PC → PS2 |
+| 0x2B | DISKINFO | PC → PS2 |
+| 0x2C | RESUME_INFO | PC → PS2 |
 | 0x30 | BENCH | PC → PS2 |
 
 ## 2. Control requests and responses
@@ -95,10 +97,12 @@ Every type except DATA and ACK uses a 12-byte header:
 | DELETE | path (file or empty directory) | – |
 | RENAME | from, to (parents of `to` are created) | – |
 | DF | – | u64 total_bytes, u64 free_bytes, u32 cluster_bytes |
-| OPEN_WRITE | u64 size, u32 flags, u32 0, u8 fingerprint[32], path | u16 handle, u16 0, u64 start_offset, u64 credit, u32 buffer_bytes, u32 buffers, u64 start_lba |
+| OPEN_WRITE | u64 size, u32 flags, u32 resume_limit_mib (0 = none), u8 fingerprint[32], path | u16 handle, u16 0, u64 start_offset, u64 credit, u32 buffer_bytes, u32 buffers, u64 start_lba |
 | CLOSE | u16 handle, u16 0, u32 0, u64 manifest | u64 PS2 manifest (also with EMISMATCH) |
 | ABORT | u16 handle, u8 delete | – |
 | BLOCKSUMS | u64 offset (multiple of 1 MiB), u32 count, path | u32 n, u32 sum[n] (n ≤ 364) |
+| DISKINFO | – | raw sector 0, raw sector 1, u64 start LBA of the mounted volume, u32 FatFs type, u32 0 (read-only diagnostics) |
+| RESUME_INFO | u64 size, u32 0, u32 0, u8 fingerprint[32], path | u64 durable offset of path.part (0 = nothing to resume), u64 0; closes an open transfer resumably first |
 | READ | u64 offset, u32 length (≤ 256 KiB), path | u64 file size, u32 bytes read; the data was sent before as READ_DATA (§6a) |
 | BENCH | u32 kind, u32 size_mb, u32 chunk, u32 flags (bit0: read back) | 112 bytes, see §6 |
 
@@ -138,6 +142,12 @@ HELLO response:
    cache, deletes `path.ps2x` and renames `path.part` → `path`.
 
 A new OPEN_WRITE while a transfer is open closes the old one resumably first.
+
+**Resume check (client):** before OPEN_WRITE with RESUME the client asks
+RESUME_INFO for the durable offset, compares BLOCKSUMS of the last (up to 32)
+whole MiB below it with the local file, and passes the first differing MiB
+(or the durable offset rounded down to a MiB) as `resume_limit_mib`. If the
+very first MiB differs, it sends the file again without RESUME.
 ABORT with delete = 0 keeps `.part` + `.ps2x` for a later resume.
 
 ## 4. DATA (PC → PS2)

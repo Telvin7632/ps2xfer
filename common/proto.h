@@ -40,7 +40,8 @@
 #define PX_T_CLOSE      0x27
 #define PX_T_ABORT      0x28
 #define PX_T_BLOCKSUMS  0x29
-#define PX_T_DISKINFO   0x2B /* read-only: raw sectors 0 and 1 + mounted volume start */
+#define PX_T_DISKINFO   0x2B
+#define PX_T_RESUME_INFO 0x2C /* closes an open transfer resumably; returns its durable offset */ /* read-only: raw sectors 0 and 1 + mounted volume start */
 #define PX_T_READ       0x2A /* read a file range; data comes as READ_DATA */
 #define PX_READ_MAX     (256 * 1024)
 
