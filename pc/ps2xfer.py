@@ -53,6 +53,7 @@ STATUS = {
     11: "not supported", 12: "checksum/manifest mismatch", 13: "no disk / no exFAT volume",
     14: "transfer incomplete",
 }
+EBUSY = 7
 
 CTL = struct.Struct("<BBHII")            # type, flags, status, req_id, session
 DATA = struct.Struct("<BBQIIHH")         # type, flags, offset, pkt_seq, csum, handle, len
@@ -188,7 +189,7 @@ class Conn:
                     continue
                 t, fl, st, r_id, sess = CTL.unpack_from(data)
                 if t == typ and fl & F_RESPONSE and r_id == rid:
-                    if typ == T_HELLO:
+                    if typ in (T_HELLO, T_PING):
                         self.addr = src
                         self.host = src[0]
                     return st, data[CTL.size:]
@@ -201,13 +202,26 @@ class Conn:
         return resp
 
     # -- commands
-    def hello(self) -> dict:
-        body = struct.pack("<III", PROTO_VERSION, random.getrandbits(32), fattime_now())
+    def discover(self):
+        """Find the PS2 by broadcast without starting a session."""
         if self.addr is None:
             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            st, r = self.request(T_HELLO, body, addr=("255.255.255.255", self.port), retries=4)
-        else:
+            self.request(T_PING, addr=("255.255.255.255", self.port), retries=4)
+
+    def hello(self, busy_wait: float = 8.0) -> dict:
+        body = struct.pack("<III", PROTO_VERSION, random.getrandbits(32), fattime_now())
+        self.discover()
+        # the PS2 refuses a new session while a file is still streaming in
+        # from another client (or from us, just before a Ctrl+C)
+        deadline = time.monotonic() + busy_wait
+        while True:
             st, r = self.request(T_HELLO, body)
+            if st != EBUSY or time.monotonic() > deadline:
+                break
+            time.sleep(0.5)
+        if st == EBUSY:
+            raise PxError("the PS2 is receiving a file from another client; "
+                          "wait until it finishes or stop that client")
         if st != 0 or len(r) < 136:
             raise PxError("bad HELLO response")
         f = struct.unpack_from("<III6sH9IQIII", r)
@@ -235,8 +249,13 @@ class Conn:
         return p.encode("utf-8") + b"\0"
 
 
-def connect(args) -> Conn:
+def connect(args, observe: bool = False) -> Conn:
+    """observe: only PING/STATS/LOG follow; no session, a running transfer
+    is not disturbed."""
     c = Conn(args.host, args.port)
+    if observe:
+        c.discover()
+        return c
     info = c.hello()
     if not args.quiet:
         ip = socket.inet_ntoa(struct.pack(">I", info["ip"]))
@@ -1132,9 +1151,7 @@ def cmd_info(args):
 
 
 def cmd_ping(args):
-    c = Conn(args.host, args.port)
-    if c.addr is None:
-        c.hello()
+    c = connect(args, observe=True)
     for _ in range(args.count):
         t = time.perf_counter()
         r = c.call(T_PING, timeout=1.0, retries=1)
@@ -1144,13 +1161,13 @@ def cmd_ping(args):
 
 
 def cmd_stats(args):
-    c = connect(args)
+    c = connect(args, observe=True)
     for k, v in c.stats().items():
         print(f"  {k:16} {v}")
 
 
 def cmd_log(args):
-    c = connect(args)
+    c = connect(args, observe=True)
     cursor = 0
     while True:
         r = c.call(T_LOG, struct.pack("<I", cursor))

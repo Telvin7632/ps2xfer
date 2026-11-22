@@ -100,6 +100,8 @@ void rxeng_start(u16 handle, u64 size, u64 start, u32 flags)
     g_rx.max_pkt_seq    = 0;
     g_rx.pkts_since_ack = 0;
     g_rx.last_ack_ms    = px_ms();
+    g_rx.last_data_ms   = g_rx.last_ack_ms;
+    g_rx.seen_pkts      = g_stats.rx_pkts;
     g_rx.credit_changed = 1;
     g_rx.manifest       = 0;
     g_rx.error          = 0;
@@ -128,6 +130,12 @@ void rxeng_stop(void)
  * hdr: the 22-byte DATA header; hdr + 2 must be 4-byte aligned (it is in the
  * SMAP header buffer: frame offset 44).
  */
+/* Data arrived recently: another client must not take over the session. */
+int rxeng_busy(void)
+{
+    return g_rx.active && px_ms() - g_rx.last_data_ms < 2000;
+}
+
 int rxeng_data(const u8 *hdr, plat_payload_reader_t rd, void *ctx)
 {
     u8 flags     = hdr[1];
@@ -312,8 +320,12 @@ void rxeng_maybe_ack(int force)
 
     if (!g_rx.active)
         return;
+    now = px_ms();
+    if (g_stats.rx_pkts != g_rx.seen_pkts) {
+        g_rx.seen_pkts    = g_stats.rx_pkts;
+        g_rx.last_data_ms = now;
+    }
     if (!force) {
-        now = px_ms();
         if (!(g_rx.credit_changed ||
               (g_rx.pkts_since_ack > 0 && now - g_rx.last_ack_ms >= g_cfg.ack_ms) ||
               now - g_rx.last_ack_ms >= 20))

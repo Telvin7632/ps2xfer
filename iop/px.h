@@ -116,6 +116,8 @@ typedef struct px_rx {
     u32 max_pkt_seq;
     u32 pkts_since_ack;
     u32 last_ack_ms;
+    u32 seen_pkts;     /* g_stats.rx_pkts at the last ack-thread look */
+    u32 last_data_ms;  /* when DATA last arrived (ack-thread resolution) */
     int credit_changed;
     u64 manifest;
     int error;         /* PX_E* that stopped the session, 0 = ok */
@@ -138,6 +140,7 @@ int rxeng_data(const u8 *hdr, plat_payload_reader_t rd, void *ctx);
 u32 rxeng_build_ack(u8 *buf);
 /* sends an ACK if one is due (force = send anyway) */
 void rxeng_maybe_ack(int force);
+int rxeng_busy(void);
 
 /* ---------------------------------------------------------------- writer */
 extern int g_writer_sem;   /* signalled when a slot becomes FULL */

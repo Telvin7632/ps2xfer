@@ -261,6 +261,21 @@ def main():
         remote["/DVD/big.iso"] = files["big.iso"]
         env.kill(signal.SIGTERM)
 
+        print("3b. a second client during a transfer must not break it")
+        env.start()
+        files["busy.iso"] = mkfile(os.path.join(d, "busy.iso"), 200 << 20, 13)
+        p = env.popen("send", os.path.join(d, "busy.iso"), "--dest", "/DVD/busy.iso", rate=15)
+        time.sleep(2)
+        out = env.run("stats")
+        assert "busy.iso" in out, out
+        out = env.run("ls", "/", check=False)
+        assert "another client" in out, out
+        out = p.communicate(timeout=120)[0]
+        assert p.returncode == 0, out[-2000:]
+        print("    stats allowed, second session refused, transfer finished")
+        remote["/DVD/busy.iso"] = files["busy.iso"]
+        env.kill(signal.SIGTERM)
+
         print("4. PS2 'power loss' (simulator killed), then resumed")
         env.start()
         files["pl.iso"] = mkfile(os.path.join(d, "pl.iso"), 120 << 20, 12)

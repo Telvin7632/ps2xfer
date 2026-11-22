@@ -82,6 +82,10 @@ static void send_resp(const u8 *req, int status, u32 body_len)
     wr32(g_resp + 8, g_session);
     plat_send(g_resp, len, NULL, 0);
 
+    /* read-only answers are not cached: a monitor polling stats must not
+     * evict the replies the transferring client may still need */
+    if (req[0] == PX_T_PING || req[0] == PX_T_STATS || req[0] == PX_T_LOG || req[0] == PX_T_HELLO)
+        return;
     c = &g_cache[g_cache_next++ % CACHE_N];
     c->req_id = rd32(req + 4);
     c->len    = len;
@@ -199,18 +203,28 @@ static void dispatch(const u8 *req, u32 len)
 
     if ((req[1] & PX_F_RESPONSE) || type == PX_T_ANNOUNCE)
         return; /* not for us: answers and other consoles' announcements */
-    if (type != PX_T_HELLO && type != PX_T_PING && rd32(req + 8) != g_session) {
+    /* PING, STATS and LOG only read; anyone may ask without a session, and
+     * they never move the data peer, so a monitor cannot disturb a transfer */
+    int observe = type == PX_T_PING || type == PX_T_STATS || type == PX_T_LOG;
+    /* a new client may not take over while a file is still streaming in */
+    int busy = type == PX_T_HELLO && rxeng_busy();
+
+    if (type != PX_T_HELLO && !observe && rd32(req + 8) != g_session) {
         send_resp(req, PX_ESESSION, 0);
         return;
     }
-    if (type != PX_T_PING)
+    if (!observe && !busy)
         plat_set_data_peer(); /* HELLO or a request of the current session */
-    if (type != PX_T_HELLO && type != PX_T_PING && cached_resend(req))
+    if (type != PX_T_HELLO && !observe && cached_resend(req))
         return;
 
     switch (type) {
         case PX_T_HELLO:
-            olen = do_hello(body, blen, out);
+            if (busy) {
+                px_log("HELLO refused: transfer in progress\n");
+                status = PX_EBUSY;
+            } else
+                olen = do_hello(body, blen, out);
             break;
         case PX_T_PING:
             wr32(out, px_ms());
