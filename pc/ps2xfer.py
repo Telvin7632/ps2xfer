@@ -573,7 +573,12 @@ def opl_warnings(dest: str) -> list[str]:
 
 
 def plan_files(paths: list[str], dest: str | None) -> list[tuple[str, str, int]]:
-    """(local path, PS2 path, size). With several sources --dest is a folder."""
+    """(local path, PS2 path, size).
+
+    A folder's CONTENTS go straight into --dest (no extra folder level), e.g.
+    `send D:\\ps2iso --dest /DVD/` puts the games directly into /DVD, where
+    OPL looks. Without --dest, .iso/.zso files of a folder go flat into /CD or
+    /DVD by size and other files keep the folder structure under /<folder>."""
     if dest and not dest.startswith("/"):
         dest = "/" + dest
     if dest and (len(paths) > 1 or os.path.isdir(paths[0])) and not dest.endswith("/"):
@@ -582,12 +587,17 @@ def plan_files(paths: list[str], dest: str | None) -> list[tuple[str, str, int]]
     for p in paths:
         if os.path.isdir(p):
             root = os.path.basename(os.path.normpath(p))
-            base = (dest or "/") + root
             for dirpath, _, files in os.walk(p):
                 for fn in sorted(files):
                     full = os.path.join(dirpath, fn)
                     rel = os.path.relpath(full, p).replace(os.sep, "/")
-                    out.append((full, base + "/" + rel, os.path.getsize(full)))
+                    size = os.path.getsize(full)
+                    if dest:
+                        out.append((full, dest + rel, size))
+                    elif os.path.splitext(fn)[1].lower() in (".iso", ".zso"):
+                        out.append((full, opl_dest(full, size, None), size))
+                    else:
+                        out.append((full, "/" + root + "/" + rel, size))
         elif os.path.isfile(p):
             size = os.path.getsize(p)
             out.append((p, opl_dest(p, size, dest), size))

@@ -48,7 +48,9 @@ run the same `send` again.
 
 ```
 python ps2xfer.py --host 192.168.0.10 send "Game (USA).iso"
-python ps2xfer.py send game1.iso game2.zso folder/ --dest /DVD/
+python ps2xfer.py send game1.iso game2.zso --dest /DVD/
+python ps2xfer.py send D:\ps2iso               # every .iso/.zso of the folder -> /CD or /DVD
+python ps2xfer.py send D:\ps2iso --dest /DVD/  # the folder's contents straight into /DVD
 python ps2xfer.py send game.iso --verify      # PS2 re-reads the file, compares 1 MiB checksums
 python ps2xfer.py send game.iso --verify --verify-full   # ... or sends it back: SHA-256 on the PC
 python ps2xfer.py get "/DVD/Game.iso" D:\backup\         # copy from the PS2 to the PC

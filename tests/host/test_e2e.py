@@ -215,7 +215,7 @@ def main():
         assert "exFAT" in out and "buffers" in out, out
         env.run("send", os.path.join(d, "odd.iso"), "--verify")
         env.run("send", os.path.join(d, "tiny.bin"), os.path.join(d, "exact.bin"), "--dest", "/misc", "--verify")
-        env.run("send", os.path.join(d, "folder"), "--dest", "/stuff")
+        env.run("send", os.path.join(d, "folder"), "--dest", "/stuff/folder")
         remote = {"/CD/odd.iso": files["odd.iso"], "/misc/tiny.bin": files["tiny.bin"],
                   "/misc/exact.bin": files["exact.bin"], "/stuff/folder/a.bin": files["folder/a.bin"],
                   "/stuff/folder/sub/b.bin": files["folder/sub/b.bin"]}
