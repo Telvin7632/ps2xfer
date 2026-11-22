@@ -322,7 +322,7 @@ static void draw(float cur, float avg, int exit_hold)
     y++;
     if (s->flags & PX_SF_XFER) {
         float pct = fsize ? (float)wr * 100.0f / (float)fsize : 0;
-        float rate = cur > 0.05f ? cur : avg; /* ETA follows the current speed */
+        float rate = avg > 0.05f ? avg : cur; /* ETA from the average: steady */
         int eta = rate > 0 ? (int)((float)(fsize - wr) / (rate * 1e6f)) : 0;
         line(y++, "  File: %.60s", s->file);
         line(y++, "  Progress: %5.1f%%   %llu / %llu MiB", pct, wr >> 20, fsize >> 20);
