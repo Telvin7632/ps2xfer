@@ -27,6 +27,8 @@
 #define PX_SF_BENCH      0x0040 /* a bench is running */
 #define PX_SF_IOMANX     0x0080 /* fs_mode=iomanx (bdmfs_fatfs, our FatFs off) */
 #define PX_SF_ERROR      0x0100 /* see last_error */
+#define PX_SF_VERIFY     0x0200 /* the PC is verifying a file (BLOCKSUMS); file/size/written = progress */
+#define PX_SF_READ       0x0400 /* the PC is reading a file (get / FTP); file/size/written = progress */
 
 typedef struct px_stats {
     unsigned int version;

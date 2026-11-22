@@ -119,6 +119,7 @@ void ack_tick(void)
         ss |= (u32)g_rx.slot[i].state << (8 + 4 * i);
     g_stats.wr_phase = (g_stats.wr_phase & 0xff) | ss;
     rxeng_maybe_ack(0);
+    fsops_task_expire();
     px_load_update();
     plat_periodic();
 }

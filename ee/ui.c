@@ -153,8 +153,15 @@ void ui_draw(const px_stats_t *s, const char *cfg_src, float cur, float avg, con
     y += 62;
 
     /* transfer */
-    panel(y, y + 112, "TRANSFER");
-    if (s->flags & PX_SF_XFER) {
+    {
+        const char *title = "TRANSFER";
+        if (!(s->flags & PX_SF_XFER) && (s->flags & PX_SF_VERIFY))
+            title = "VERIFYING (checksums read back from the HDD)";
+        else if (!(s->flags & PX_SF_XFER) && (s->flags & PX_SF_READ))
+            title = "SENDING TO THE PC";
+        panel(y, y + 112, title);
+    }
+    if (s->flags & (PX_SF_XFER | PX_SF_VERIFY | PX_SF_READ)) {
         unsigned long long size = u64of(s->file_size_lo, s->file_size_hi);
         unsigned long long done = u64of(s->written_lo, s->written_hi);
         float pct = size ? (float)done * 100.0f / (float)size : 0;
@@ -168,7 +175,8 @@ void ui_draw(const px_stats_t *s, const char *cfg_src, float cur, float avg, con
         snprintf(b, sizeof(b), "%.40s", fn);
         text(14, y + 20, T, C_TEXT, b);
         rect(14, y + 42, W - 14, y + 62, C_BARBG);
-        rect(14, y + 42, 14 + (W - 28) * pct / 100.0f, y + 62, C_ACCENT);
+        rect(14, y + 42, 14 + (W - 28) * pct / 100.0f, y + 62,
+             (s->flags & PX_SF_XFER) ? C_ACCENT : (s->flags & PX_SF_VERIFY) ? C_OK : C_WARN);
         snprintf(b, sizeof(b), "%.1f%%", pct);
         text(W / 2 - 24, y + 44, S, C_TEXT, b);
         snprintf(b, sizeof(b), "%llu / %llu MiB   %.2f MB/s   ETA %d:%02d:%02d", done >> 20, size >> 20, avg, eta / 3600,

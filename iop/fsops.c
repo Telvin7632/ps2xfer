@@ -702,6 +702,41 @@ int fsops_df(u8 *resp, u32 *rlen)
 /* body: u64 offset (multiple of 1 MiB), u32 count, path\0
    -> u32 count, u32 sums[] (word-Fletcher of each 1 MiB block, the last one
    zero-padded to 4 bytes) */
+/* ---------------------------------------------------------------- screen progress
+ * Verify and read have no OPEN/CLOSE of their own: each request refreshes
+ * the progress, and fsops_task_expire() (ack thread, periodic) clears it
+ * 3 s after the last one. The file fields belong to a write while one runs. */
+static u32 g_task_ms;
+
+static void task_progress(u32 flag, const char *path, u64 size, u64 done)
+{
+    if (g_stats.flags & PX_SF_XFER)
+        return;
+    if (!(g_stats.flags & flag) || strcmp(g_stats.file, path) != 0)
+        px_strlcpy(g_stats.file, path, sizeof(g_stats.file));
+    g_stats.file_size_lo = (u32)size;
+    g_stats.file_size_hi = (u32)(size >> 32);
+    g_stats.written_lo   = (u32)done;
+    g_stats.written_hi   = (u32)(done >> 32);
+    g_task_ms = px_ms();
+    {
+        int st = plat_lock();
+        g_stats.flags = (g_stats.flags & ~(PX_SF_VERIFY | PX_SF_READ)) | flag;
+        plat_unlock(st);
+    }
+}
+
+void fsops_task_expire(void)
+{
+    if ((g_stats.flags & (PX_SF_VERIFY | PX_SF_READ)) && px_ms() - g_task_ms > 3000) {
+        int st = plat_lock();
+        g_stats.flags &= ~(PX_SF_VERIFY | PX_SF_READ);
+        if (!(g_stats.flags & PX_SF_XFER))
+            g_stats.file[0] = 0;
+        plat_unlock(st);
+    }
+}
+
 int fsops_blocksums(const u8 *req, u32 len, u8 *resp, u32 *rlen)
 {
     char path[MAX_PATH];
@@ -749,6 +784,7 @@ int fsops_blocksums(const u8 *req, u32 len, u8 *resp, u32 *rlen)
         if (fr != FR_OK || got_total == 0)
             break;
         wr32(resp + 4 + i * 4, px_fletcher_final(&fl));
+        task_progress(PX_SF_VERIFY, path, f_size(&f), off + (u64)i * (1u << 20) + got_total);
     }
     f_close(&f);
     px_fs_unlock();
@@ -891,6 +927,7 @@ int fsops_read(const u8 *req, u32 len, u32 req_id, u8 *resp, u32 *rlen)
         wr16(h + 20, (u16)n);
         plat_send_data(h, g_bufmem + pos, n);
     }
+    task_progress(PX_SF_READ, path, fsize, off + got);
     wr64(resp, fsize);
     wr32(resp + 8, got);
     *rlen = 12;

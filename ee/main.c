@@ -334,11 +334,12 @@ static void draw(float cur, float avg, int exit_hold)
     line(y++, "  IOP: free %u KiB, buffers %u x %u KiB, CPU %u.%u%%", s->iop_free / 1024, s->nbuf,
          s->bufsize / 1024, s->cpu_load_x10 / 10, s->cpu_load_x10 % 10);
     y++;
-    if (s->flags & PX_SF_XFER) {
+    if (s->flags & (PX_SF_XFER | PX_SF_VERIFY | PX_SF_READ)) {
         float pct = fsize ? (float)wr * 100.0f / (float)fsize : 0;
         float rate = avg > 0.05f ? avg : cur; /* ETA from the average: steady */
         int eta = rate > 0 ? (int)((float)(fsize - wr) / (rate * 1e6f)) : 0;
-        line(y++, "  File: %.60s", s->file);
+        line(y++, "  %s %.56s", (s->flags & PX_SF_XFER) ? "File:" : (s->flags & PX_SF_VERIFY) ? "Verify:" : "To PC:",
+             s->file);
         line(y++, "  Progress: %5.1f%%   %llu / %llu MiB", pct, wr >> 20, fsize >> 20);
         line(y++, "  Speed: %5.2f MB/s (avg %5.2f)   ETA %d:%02d:%02d", cur, avg, eta / 3600, eta / 60 % 60,
              eta % 60);
@@ -376,7 +377,8 @@ int main(int argc, char *argv[])
     float cur = 0, avg = 0;
     u64 xfer_start_bytes = 0;
     clock_t xfer_start_t = 0;
-    int was_xfer = 0;
+    u32 was_task = 0;          /* PX_SF_XFER / VERIFY / READ of the last poll */
+    char task_file[64] = "";
 
     read_config(argc, argv);
     reset_iop();
@@ -438,18 +440,23 @@ int main(int argc, char *argv[])
         }
         now = clock();
         rx = u64of(g_st.written_lo, g_st.written_hi);
-        if ((g_st.flags & PX_SF_XFER) && !was_xfer) {
-            xfer_start_bytes = rx;
-            xfer_start_t = now;
-            prev_rx = rx;
-            cur = avg = 0;
+        {
+            /* a new write, verify or read (or the next file of one): new speed/ETA */
+            u32 task = g_st.flags & (PX_SF_XFER | PX_SF_VERIFY | PX_SF_READ);
+            if (task && (task != was_task || strncmp(task_file, g_st.file, sizeof(task_file)) != 0)) {
+                xfer_start_bytes = rx;
+                xfer_start_t = now;
+                prev_rx = rx;
+                cur = avg = 0;
+                memcpy(task_file, g_st.file, sizeof(task_file) - 1);
+            }
+            was_task = task;
         }
-        was_xfer = (g_st.flags & PX_SF_XFER) != 0;
         /* every poll (4x per second): instantaneous rate, smoothed with a
            ~1 s time constant (the written counter moves in 352 KiB steps) */
         if (now - prev_t >= CLOCKS_PER_SEC / 8) {
             float dt = (float)(now - prev_t) / CLOCKS_PER_SEC;
-            if (was_xfer) {
+            if (was_task && rx >= prev_rx) {
                 float inst = (float)(rx - prev_rx) / dt / 1e6f;
                 float a = dt / (1.0f + dt);
                 cur = (cur <= 0.0f) ? inst : cur + (inst - cur) * a;

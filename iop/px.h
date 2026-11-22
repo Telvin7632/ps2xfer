@@ -141,6 +141,7 @@ u32 rxeng_build_ack(u8 *buf);
 /* sends an ACK if one is due (force = send anyway) */
 void rxeng_maybe_ack(int force);
 int rxeng_busy(void);
+void fsops_task_expire(void);
 
 /* ---------------------------------------------------------------- writer */
 extern int g_writer_sem;   /* signalled when a slot becomes FULL */
