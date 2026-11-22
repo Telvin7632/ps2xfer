@@ -101,6 +101,29 @@ static int cached_resend(const u8 *req)
     return 0;
 }
 
+/* EXIT (PC, pad or power-off): keep an open transfer resumable, flush the
+   disk and give the write buffers back, so the EE can load the memory card
+   driver for exit_elf (the IOP is otherwise full). Runs on the control thread. */
+static void do_shutdown(void)
+{
+    int st;
+
+    if (g_rx.active)
+        fsops_abort(NULL, 0);
+    px_ata_lock();
+    plat_bd_flush();
+    px_ata_unlock();
+    st = plat_lock();
+    g_rx.active = 0;
+    plat_unlock(st);
+    if (g_bufmem != NULL) {
+        plat_free(g_bufmem);
+        g_bufmem      = NULL;
+        g_bufmem_size = 0;
+    }
+    g_stats.flags |= PX_SF_EXIT;
+}
+
 static u32 do_hello(const u8 *body, u32 blen, u8 *out)
 {
     u64 disk = plat_bd_sectors() * 512;
@@ -206,10 +229,8 @@ static void dispatch(const u8 *req, u32 len)
             break;
         }
         case PX_T_EXIT:
-            if (g_rx.active)
-                fsops_abort(NULL, 0);
-            g_stats.flags |= PX_SF_EXIT;
             px_log("EXIT requested by the PC\n");
+            do_shutdown();
             break;
         case PX_T_LIST:
             status = fsops_list(body, blen, out, &olen);
@@ -274,12 +295,7 @@ void ctrl_thread(void *arg)
         plat_sem_wait(g_mbox_sem);
         if (g_shutdown_req) {
             g_shutdown_req = 0;
-            if (g_rx.active)
-                fsops_abort(NULL, 0);
-            px_ata_lock();
-            plat_bd_flush();
-            px_ata_unlock();
-            g_stats.flags |= PX_SF_EXIT;
+            do_shutdown();
             plat_sem_signal(g_shutdown_done);
             continue;
         }

@@ -11,6 +11,7 @@
 #include <sbv_patches.h>
 #include <libpad.h>
 #include <libpwroff.h>
+#include <elf-loader.h>
 #include <debug.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -401,8 +402,25 @@ int main(int argc, char *argv[])
                 clock_t t = clock();
                 while (clock() - t < CLOCKS_PER_SEC) {}
             }
-            if (g_exit_elf[0])
-                LoadExecPS2(g_exit_elf, 0, NULL); /* e.g. mc0:/BOOT/PS2LINK.ELF */
+            if (g_exit_elf[0]) { /* e.g. mc0:/PS2LINK/PS2LINK.ELF */
+                /* elf-loader checks the file through the current IOP: load the
+                   memory card driver (the IOP module freed its write buffers on
+                   EXIT to make room). The loader then resets the IOP itself. */
+                int r1 = 0, r2 = 0, rl;
+
+                if (strncmp(g_exit_elf, "mc", 2) == 0) {
+                    r1 = SifLoadModule("rom0:MCMAN", 0, NULL);
+                    r2 = SifLoadModule("rom0:MCSERV", 0, NULL);
+                }
+                sbv_patch_disable_prefix_check();
+                rl = LoadELFFromFile(g_exit_elf, 0, NULL);
+                /* only reached on failure */
+                line(23, "  exit_elf %.40s failed: %d (MCMAN %d, MCSERV %d)", g_exit_elf, rl, r1, r2);
+                {
+                    clock_t t = clock();
+                    while (clock() - t < 5 * CLOCKS_PER_SEC) {}
+                }
+            }
             Exit(0);
         }
         {

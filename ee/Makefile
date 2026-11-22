@@ -7,7 +7,7 @@ IRX_SDK = iomanX poweroff ps2dev9 bdm bdmfs_fatfs ata_bd
 IRX_C   = $(addsuffix _irx.c,$(IRX_SDK)) ps2xfer_irx.c
 
 EE_OBJS = main.o $(IRX_C:.c=.o)
-EE_LIBS = -ldebug -lpad -lpatches -lpoweroff
+EE_LIBS = -ldebug -lpad -lpatches -lpoweroff -lelf-loader
 EE_CFLAGS += -Wall -I../common
 EE_INCS += -I../common
 
