@@ -14,6 +14,27 @@
    then pushes the status there by SIF DMA every 250 ms from its high-priority
    ack thread (the RPC thread starves while a transfer keeps the IOP busy) */
 #define PX_RPC_SET_PUSH  3
+/* EE checksum helper for verify (BLOCKSUMS). The EE sends u32[4]: physical
+   addresses of two PX_SUM_CHUNK buffers, PX_SUM_CHUNK, 0. The IOP reads a
+   chunk from the disk and sends it with SIF command PX_SIFCMD_CHUNK (the
+   data travels as the command's extra DMA); the EE sums it and answers with
+   PX_SIFCMD_SUMS. User command ids: each side registers its own table. */
+#define PX_RPC_SET_SUM   4
+#define PX_SUM_CHUNK     (512 * 1024)
+#define PX_SIFCMD_CHUNK  0 /* IOP -> EE, handled on the EE */
+#define PX_SIFCMD_SUMS   0 /* EE -> IOP, handled on the IOP */
+#define PX_SUM_FIRST     1 /* first chunk of a 1 MiB block: reset the sum */
+#define PX_SUM_LAST      2 /* last chunk of the block: report the sum */
+
+typedef struct px_sumcmd {      /* 32 bytes, 16-byte multiple */
+    unsigned int sif_hdr[4];    /* SifCmdHeader_t, filled by sceSifSendCmd */
+    unsigned int seq, buf, len, flags;
+} px_sumcmd_t;
+
+typedef struct px_sumdone {
+    unsigned int sif_hdr[4];
+    unsigned int seq, csum, flags, reserved;
+} px_sumdone_t;
 
 #define PX_STATS_VERSION 2
 

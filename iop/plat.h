@@ -65,6 +65,16 @@ void plat_periodic(void);
 /* stops pushing status into EE memory and waits for the last push
    (before the EE starts another program) */
 void plat_push_stop(void);
+
+/* EE checksum helper for verify (PS2 only; the host has none).
+ * plat_ee_sum_send: SIF DMA id, 0 = could not queue. len <= PX_SUM_CHUNK;
+ * src must have room up to len rounded to 16 (the tail is zeroed).
+ * plat_ee_sum_result: 1 when the answer for seq arrived. */
+int plat_ee_sum_ready(void);
+u32 plat_ee_sum_send(u32 seq, int buf, void *src, u32 len, u32 flags);
+int plat_ee_dma_done(u32 trid);
+int plat_ee_sum_result(u32 seq, u32 *csum, u32 *flags);
+void plat_ee_sum_disable(void);
 /* writer: run the next ATA command above the RX thread (on=1) or back at
    the writer priority (on=0; lets RX drain the FIFO right away) */
 void plat_writer_boost(int on);

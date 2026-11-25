@@ -204,6 +204,13 @@ u32 plat_idle_count(void) { return 0; }
 
 void plat_periodic(void) {}
 void plat_push_stop(void) {}
+
+/* no EE on the host: verify always sums on the "IOP" */
+int plat_ee_sum_ready(void) { return 0; }
+u32 plat_ee_sum_send(u32 seq, int buf, void *src, u32 len, u32 flags) { return 0; }
+int plat_ee_dma_done(u32 trid) { return 1; }
+int plat_ee_sum_result(u32 seq, u32 *csum, u32 *flags) { return 0; }
+void plat_ee_sum_disable(void) {}
 void plat_writer_boost(int on) { (void)on; }
 
 u32 plat_bench_micro(u32 *vals, u32 n)

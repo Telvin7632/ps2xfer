@@ -35,6 +35,7 @@ typedef struct px_cfg {
     u32 fs_iomanx;     /* 1: bdmfs_fatfs owns the volume; our FatFs off */
     u32 wr_boost;      /* 1: each ATA write chunk runs above the RX thread;
                           use with a small ata_chunk (FIFO holds ~1.3 ms) */
+    u32 ee_sum;        /* 1: verify checksums on the EE when it offers them */
 } px_cfg_t;
 
 extern px_cfg_t g_cfg;
@@ -143,6 +144,7 @@ void rxeng_maybe_ack(int force);
 int rxeng_busy(void);
 void fsops_task_expire(void);
 void fsops_readahead_service(void);
+void eesum_register(const u32 *arg); /* PS2 only (RPC thread) */
 
 /* ---------------------------------------------------------------- writer */
 extern int g_writer_sem;   /* signalled when a slot becomes FULL */

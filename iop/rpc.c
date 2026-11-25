@@ -23,6 +23,9 @@ static void *rpc_handler(int fno, void *buf, int size)
             g_push_addr = *(u32 *)buf;
             memcpy(buf, &g_stats, sizeof(g_stats));
             break;
+        case PX_RPC_SET_SUM:
+            eesum_register((const u32 *)buf);
+            break;
         case PX_RPC_EXIT:
             px_log("EXIT requested on the PS2\n");
             ctrl_shutdown_sync();

@@ -6,7 +6,7 @@ EE_BIN  = ps2xfer.elf
 IRX_SDK = iomanX poweroff ps2dev9 bdm bdmfs_fatfs ata_bd
 IRX_C   = $(addsuffix _irx.c,$(IRX_SDK)) ps2xfer_irx.c
 
-EE_OBJS = main.o ui.o $(IRX_C:.c=.o)
+EE_OBJS = main.o ui.o eesum.o $(IRX_C:.c=.o)
 EE_LIBS = -L$(GSKIT)/lib -lgskit_toolkit -lgskit -ldmakit -ldebug -lpad -lpatches -lpoweroff -lelf-loader-nocolour
 EE_CFLAGS += -Wall -I../common -MMD -MP  # .d files: header changes rebuild the users
 EE_INCS += -I../common -I$(GSKIT)/include

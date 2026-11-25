@@ -22,6 +22,7 @@
 #include "px_stats.h"
 #include "proto.h"
 #include "ui.h"
+#include "eesum.h"
 
 #define VERSION "0.1.0"
 
@@ -414,6 +415,11 @@ int main(int argc, char *argv[])
     FlushCache(0);
     g_push_arg[0] = (u32)&g_push & 0x1fffffff;
     SifCallRpc(&g_rpc, PX_RPC_SET_PUSH, 0, g_push_arg, sizeof(g_push_arg), &g_st, sizeof(g_st), NULL, NULL);
+
+    /* verify checksums on the EE (the IOP falls back to its own if this fails) */
+    ChangeThreadPriority(GetThreadId(), 64);
+    if (eesum_start(&g_rpc, 64) != 0)
+        snprintf(g_msg, sizeof(g_msg), "EE verify helper failed; verify runs on the IOP");
 
     g_gs_ok = (ui_init(g_screen_x, g_screen_y) == 0);
     if (!g_gs_ok) {

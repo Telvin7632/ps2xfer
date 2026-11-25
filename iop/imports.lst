@@ -48,6 +48,9 @@ I_sceSifInitRpc
 I_sceSifRegisterRpc
 I_sceSifSetRpcQueue
 I_sceSifRpcLoop
+I_sceSifSetCmdBuffer
+I_sceSifAddCmdHandler
+I_sceSifSendCmd
 sifcmd_IMPORTS_end
 
 sysclib_IMPORTS_start

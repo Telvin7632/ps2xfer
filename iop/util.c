@@ -33,6 +33,7 @@ void px_cfg_defaults(px_cfg_t *c)
     c->prof       = 0;
     c->state_mb   = 32;
     c->fs_iomanx  = 0;
+    c->ee_sum     = 1;
 }
 
 int px_parse_ip(const char *s, u32 *ip)
@@ -101,6 +102,7 @@ static const struct cfg_key cfg_keys[] = {
     K("state_mb", state_mb, 1, 4096, 1),
     K("fs_iomanx", fs_iomanx, 0, 1, 0),
     K("wr_boost", wr_boost, 0, 1, 1),
+    K("ee_sum", ee_sum, 0, 1, 1),
 };
 
 int px_cfg_set(px_cfg_t *c, const char *kv, int live)

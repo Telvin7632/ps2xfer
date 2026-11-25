@@ -831,6 +831,137 @@ static int blocksums_contig(FIL *f, const char *path, u64 off, u32 count, u8 *re
     return (int)blk;
 }
 
+/* ---------------------------------------------------------------- verify on the EE
+ * IOP: read 512 KiB from the disk, hand it to the EE (SIF command + DMA),
+ * read the next one meanwhile; the EE sums at a fraction of the IOP's cost.
+ * The first block after boot is also summed here and compared, so a broken
+ * EE path disables itself instead of reporting false mismatches. */
+static u32 g_ee_seq;
+static int g_ee_checked;
+
+static int ee_wait_dma(u32 trid)
+{
+    u32 t;
+
+    for (t = 0; t < 20000; t++) { /* 2 s */
+        if (plat_ee_dma_done(trid))
+            return 0;
+        plat_sleep_us(100);
+    }
+    return -1;
+}
+
+static int ee_wait_result(u32 seq, u32 *csum, u32 *flags)
+{
+    u32 t;
+
+    for (t = 0; t < 20000; t++) {
+        if (plat_ee_sum_result(seq, csum, flags))
+            return 0;
+        plat_sleep_us(100);
+    }
+    return -1;
+}
+
+static int blocksums_ee(FIL *f, const char *path, u64 off, u32 count, u8 *resp)
+{
+    const u32 ch = PX_SUM_CHUNK, per_block = (1u << 20) / PX_SUM_CHUNK;
+    px_extent_t e;
+    u64 fsize = f_size(f), end;
+    u32 nch, k, j, blk = 0, base, trid[2] = {0, 0}, sent = 0, got = 0;
+    u8 *ib[2];
+    px_fletcher_t chk;
+    int err = 0;
+
+    if (!plat_ee_sum_ready() || g_bufmem_size < 2 * ch)
+        return -PX_ENOTSUP;
+    if (count == 0 || (off & 511) || off >= fsize || file_extent(f, fsize, &e) != 0)
+        return -PX_ENOTSUP;
+    end = off + ((u64)count << 20);
+    if (end > fsize)
+        end = fsize;
+    nch   = (u32)((end - off + ch - 1) / ch);
+    ib[0] = g_bufmem;
+    ib[1] = g_bufmem + ch;
+    base  = g_ee_seq;
+    g_ee_seq += nch;
+    px_fletcher_init(&chk);
+
+    for (k = 0; k < nch && !err; k++) {
+        u32 b = k & 1, flags = 0, csum, rflags;
+        u64 pos = off + (u64)k * ch;
+        u32 len = (u32)(end - pos < ch ? end - pos : ch);
+
+        /* IOP buffer b is free once chunk k-2 left it */
+        if (k >= 2 && ee_wait_dma(trid[b]) != 0) {
+            err = -PX_ENOTSUP;
+            break;
+        }
+        if (px_extent_read(&e, pos >> 9, ib[b], (len + 511) >> 9) != 0) {
+            err = -PX_EIO;
+            break;
+        }
+        /* EE buffer b is free once the EE answered chunk k-2 */
+        if (k >= 2) {
+            j = k - 2;
+            if (ee_wait_result(base + j, &csum, &rflags) != 0) {
+                err = -PX_ENOTSUP;
+                break;
+            }
+            got++;
+            if (rflags & PX_SUM_LAST) {
+                wr32(resp + 4 + blk * 4, csum);
+                blk++;
+            }
+        }
+        if (k % per_block == 0)
+            flags |= PX_SUM_FIRST;
+        if ((k + 1) % per_block == 0 || k + 1 == nch)
+            flags |= PX_SUM_LAST;
+        if (!(trid[b] = plat_ee_sum_send(base + k, (int)b, ib[b], len, flags))) {
+            err = -PX_ENOTSUP;
+            break;
+        }
+        sent++;
+        if (!g_ee_checked && k < per_block) /* the zeroed tail is part of the sum */
+            px_fletcher_update(&chk, ib[b], (len + 3) & ~3u);
+        task_progress(PX_SF_VERIFY, path, fsize, pos + len);
+    }
+    /* collect what is still in flight (also after an error: buffers are reused) */
+    for (j = got; j < sent; j++) {
+        u32 csum, rflags;
+
+        if (ee_wait_result(base + j, &csum, &rflags) != 0) {
+            err = -PX_ENOTSUP;
+            break;
+        }
+        if (!err && (rflags & PX_SUM_LAST)) {
+            wr32(resp + 4 + blk * 4, csum);
+            blk++;
+        }
+    }
+    for (j = 0; j < 2; j++)
+        if (trid[j] && ee_wait_dma(trid[j]) != 0)
+            err = -PX_ENOTSUP;
+    if (err == -PX_ENOTSUP) {
+        px_log("EE verify helper not answering: verify on the IOP from now on\n");
+        plat_ee_sum_disable();
+    }
+    if (err)
+        return err;
+    if (!g_ee_checked && blk > 0) {
+        u32 mine = px_fletcher_final(&chk);
+        if (mine != rd32(resp + 4)) {
+            px_log("EE verify helper: sum %08x, IOP %08x: disabled\n", (unsigned)rd32(resp + 4), (unsigned)mine);
+            plat_ee_sum_disable();
+            return -PX_ENOTSUP;
+        }
+        px_log("EE verify helper: first block checked against the IOP\n");
+        g_ee_checked = 1;
+    }
+    return (int)blk;
+}
+
 int fsops_blocksums(const u8 *req, u32 len, u8 *resp, u32 *rlen)
 {
     char path[MAX_PATH];
@@ -855,7 +986,9 @@ int fsops_blocksums(const u8 *req, u32 len, u8 *resp, u32 *rlen)
     px_fs_lock();
     fr = f_open(&f, path, FA_READ);
     if (fr == FR_OK) {
-        int n = blocksums_contig(&f, path, off, count, resp);
+        int n = blocksums_ee(&f, path, off, count, resp);
+        if (n == -PX_ENOTSUP)
+            n = blocksums_contig(&f, path, off, count, resp);
         if (n != -PX_ENOTSUP) {
             f_close(&f);
             px_fs_unlock();

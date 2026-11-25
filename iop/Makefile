@@ -3,7 +3,7 @@
 
 IOP_BIN  = ps2xfer.irx
 IOP_OBJS = main.o net.o smap.o smap_xfer.o plat_ps2.o rpc.o \
-           util.o log.o rxeng.o writer.o ctrl.o fsops.o disk.o bench.o \
+           util.o log.o rxeng.o writer.o ctrl.o fsops.o disk.o bench.o eesum.o \
            ff.o ffunicode.o imports.o
 
 IOP_OPTFLAGS = -O2
