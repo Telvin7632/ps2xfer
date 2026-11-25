@@ -618,6 +618,57 @@ Neutrino is not a launch target; only OPL beta with exFAT.
 6. UDP port **7690**. §3.3
 7. Python first, Go only if measurements show Python cannot pace 9 000 pps. §12
 
+## 15a. Changes after Phase 4 (2026-11-22 … 2026-11-25)
+
+**Sessions.** The PS2 keeps up to 8 client sessions (HELLO adds one, the least
+recently used drops out, never the one writing). PING, STATS and LOG need no
+session. Responses carry the asking client's session; the retransmit cache
+matches req_id and session. The *data peer* (where ACKs and READ_DATA go) is
+taken only by OPEN_WRITE and READ, so a monitor (`stats`, GUI, FTP) never
+diverts a running transfer. OPEN_WRITE and RESUME_INFO (both close an open
+transfer) from another session get EBUSY while DATA arrived in the last 2 s;
+a silent sender (crash, cable) can be replaced so its file resumes. The client
+retries EBUSY for 8 s. (A PCSX2 ANNOUNCE on the LAN and a `stats` poll each
+stalled a real transfer before this.)
+
+**Control thread priority 18** (was 30): above the writer, below RX and ACK.
+During a transfer the IOP is ~100 % busy; at 30 the control thread starved
+(ls 1.6–3.6 s or timeouts). At 18 it answers in ~0.2 s and the transfer keeps
+9.44 MB/s: commands are short, and the long ones (BLOCKSUMS, benches) are
+refused while a write is active. `wait_writer_idle()` sleeps, so the writer
+cannot be starved by it.
+
+**Verify on the EE.** `BLOCKSUMS` of a contiguous file: the IOP reads 512 KiB
+chunks with `px_extent_read` into two halves of the write buffers and sends
+each with `sceSifSendCmd(PX_SIFCMD_CHUNK, …, src, ee_buf, len)`: the chunk is
+the command's extra DMA, so it is in EE memory before the EE command handler
+runs. The handler queues it for a worker thread (priority above the screen
+loop) that invalidates the D-cache range, sums the words (running sum across
+the two chunks of a 1 MiB block) and answers with `PX_SIFCMD_SUMS`; the IOP
+command handler stores the result for the waiting control thread. Two chunks
+are in flight: the IOP reads chunk k while the EE sums chunk k-1. The EE
+registers its two buffers with `PX_RPC_SET_SUM`; each side registers its own
+one-entry user command table (none of the loaded modules uses user commands).
+Safety: the first block after boot is summed on the IOP too and compared; a
+mismatch or a 2 s silence switches the helper off and BLOCKSUMS falls back to
+the IOP (unrolled Fletcher, read-ahead on the idle writer thread; fragmented
+files read through FatFs). `ee_sum=0` forces the IOP path. Result: ~45 MB/s
+instead of ~18 MB/s. The PC sums its own copy in a thread at the same time.
+
+**Screen.** gsKit + the console's FONTM font, title-safe area, panels for
+network, disk and transfer/verify/read-back; the picture moves with the D-pad
+or `screen_x`/`screen_y`. Verify and read-back progress come from
+`PX_SF_VERIFY`/`PX_SF_READ` (+ file, size, position in the status block),
+cleared 3 s after the last request.
+
+**MTU.** DATA is 1458 bytes of IP and the PS2 does not reassemble fragments.
+The client checks `IP_MTU` on Linux/WSL and gives up after 15 s without
+progress, naming the cause (WSL2 NAT showed MTU 1300 on the owner's PC).
+
+**Build.** IOP and EE Makefiles track header dependencies (`-MMD -MP`): a
+field added to `px_rx_t` once left stale objects with the old layout and
+stalled transfers on the console.
+
 ## 16. Repository layout (planned)
 
 ```

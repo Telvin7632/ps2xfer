@@ -183,3 +183,21 @@ patched dev9 module.
 | RX micro-optimisations (combined, 4 GiB) | 9.47 | 9.50 |
 | client burst 2 → 6 (combined, 1 GiB) | 9.46 | 9.57 |
 | writer priority boost (wr_boost) | 9.44 | ≤ 9.39 (worse) |
+
+
+## Verify, read-back, commands during a send (2026-11-25, real PS2)
+
+Fat PS2, ST3320413CS (UDMA 4), direct cable, Windows client.
+
+| Operation | Result | How |
+|---|---:|---|
+| `--verify` God of War (8128 MiB), first version | 700 s = 11.6 MB/s | Fletcher on the IOP; the PC summed its copy after the PS2 answered |
+| `--verify` God of War II (8139 MiB) | 473 s = 18 MB/s | unrolled Fletcher; PC sums in parallel |
+| `--verify` God of War (8128 MiB) | **190.8 s = ~45 MB/s** | Fletcher on the EE, the IOP only reads the disk |
+| `get` 572 MiB | **115.6 s = 5.19 MB/s**, 0 re-requests | disk read and TX not overlapped yet |
+| `ls` during a 9.44 MB/s send | 1.6–3.6 s or timeout → **0.17–0.23 s** | control thread priority 30 → 18; send still 9.44 MB/s, 0 retransmits |
+
+Why verify on the IOP stopped at ~18 MB/s: word-Fletcher costs ~1500 ticks/KiB
+(§1) → ~25 MB/s on its own, and ps2dev9 spins the CPU during the ATA DMA, so
+disk time (~19 ms/MiB) adds to it instead of overlapping. On the EE the sum is
+nearly free and the IOP is left with the disk read (~55 MB/s) and the SIF DMA.

@@ -14,10 +14,11 @@ device). The disk stays in the console.
 
 > **Status:** works on a real console. Tested on a fat PS2 with a 320 GB
 > disk (exFAT, formatted on the console): **9.5 MB/s sustained** with no lost
-> packets (the IOP is the limit, see `docs/BENCHMARKS.md`), files of 4.5 GiB,
-> read-back verification, games booting from OPL 1.2.0-Beta-2271. Resume after
-> an interrupted transfer is tested in PCSX2 and in the host simulator
-> (`make test`), not yet by pulling the cable on a console.
+> packets (the IOP is the limit, see `docs/BENCHMARKS.md`), games of 8 GiB,
+> `--verify` at **~45 MB/s** (checksums on the EE), copying back to the PC at
+> 5.2 MB/s, games booting from OPL 1.2.0-Beta-2271. Resume after an
+> interrupted transfer works on the console (stalled sends resumed at 7.4 GiB);
+> pulling the cable is tested in PCSX2 and the host simulator (`make test`).
 
 Every file is written as **one contiguous run** (exFAT "NoFatChain"),
 preallocated before the data arrives. That is the best case for OPL. During
@@ -42,7 +43,11 @@ run the same `send` again.
    see `ps2xfer.ini.example`. Without it the IP comes from wLaunchELF's
    `mc0:/SYS-CONF/IPCONFIG.DAT`, otherwise **192.168.0.10** is used.
 3. The screen shows the IP, link mode, disk model and UDMA mode, free space,
-   and during a transfer the file, progress, speed and error counters.
+   and during a transfer the file, progress bar, speed, ETA and error
+   counters; during `--verify` a green VERIFYING bar, during a copy to the PC
+   a SENDING TO THE PC bar. If the TV cuts an edge, move the picture with the
+   **D-pad**; the screen shows the values to keep in `ps2xfer.ini`
+   (`screen_x=`, `screen_y=`).
 4. To leave, hold **START** for 2 seconds (or run `ps2xfer.py exit`). An
    unfinished transfer is kept for resuming.
 
@@ -119,12 +124,27 @@ delete and create folders. Notes:
 * empty files cannot be created on the PS2;
 * files cannot be edited in place: copy, edit, copy back.
 
+### Several programs at once
+
+The window, the FTP gateway, `stats`, `ls` and other commands can be used
+while a file is being sent (each client gets its own session; the PS2 answers
+commands within ~0.2 s during a transfer). Only one file is written at a
+time: a second `send` gets "the PS2 is receiving a file from another client"
+until the first one finishes. If a client crashes or the cable is pulled, the
+next `send` of the same file takes over after 2 s and resumes.
+
 ### WSL
 
 WSL2 in the default NAT mode passes unicast UDP but **not broadcast**, so
 discovery does not work there. Either run the client natively on Windows
 (`py ps2xfer.py ...`), pass `--host`, or enable mirrored networking
 (`networkingMode=mirrored` in `%UserProfile%\.wslconfig`).
+
+Data packets need a **1500-byte MTU** on the way to the PS2 (1458 bytes of
+IP). Some WSL2 NAT setups and VPNs have less (e.g. 1300): then commands work
+but no data arrives. On Linux/WSL the client warns about it when it connects,
+and a send stops after 15 s without progress. Use the Windows client or
+mirrored networking.
 
 ## Testing in PCSX2
 
