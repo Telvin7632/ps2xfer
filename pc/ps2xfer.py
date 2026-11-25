@@ -257,6 +257,27 @@ class Conn:
         return p.encode("utf-8") + b"\0"
 
 
+MTU_HINT = ("data packets need a 1500-byte MTU on the way to the PS2 (no VPN, no WSL2 "
+            "NAT network: run the Windows client 'py ps2xfer.py', or set "
+            "networkingMode=mirrored in .wslconfig)")
+NEED_MTU = 20 + 8 + DATA.size + PAYLOAD  # IP + UDP + DATA header + payload = 1458
+
+
+def path_mtu(addr) -> int | None:
+    """MTU of the route to addr (Linux/WSL only; None elsewhere)."""
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(addr)
+            return s.getsockopt(socket.IPPROTO_IP, getattr(socket, "IP_MTU", 14))
+        finally:
+            s.close()
+    except OSError:
+        return None
+
+
 def connect(args, observe: bool = False) -> Conn:
     """observe: only PING/STATS/LOG follow; no session, a running transfer
     is not disturbed."""
@@ -265,6 +286,10 @@ def connect(args, observe: bool = False) -> Conn:
         c.discover()
         return c
     info = c.hello()
+    mtu = path_mtu(c.addr)
+    if mtu is not None and mtu < NEED_MTU:
+        print(f"WARNING: the route to the PS2 has MTU {mtu}, transfers need {NEED_MTU}: {MTU_HINT}",
+              file=sys.stderr)
     if not args.quiet:
         ip = socket.inet_ntoa(struct.pack(">I", info["ip"]))
         print(f"PS2 {ip} ({c.host}) ps2xfer {info['version']}, link: {link_text(info['link'])}")
@@ -339,6 +364,7 @@ class Sender:
         self.manifest = 0
         self.retransmits = 0
         self.last_progress = time.monotonic()
+        self.last_advance = time.monotonic()  # the PS2 took new data (not reset by timeouts)
         self.last_ack_time = time.monotonic()
         self.rto = 0.1
         self.rx_errors = None
@@ -396,7 +422,7 @@ class Sender:
         bm = int.from_bytes(data[ACK.size:ACK.size + nbytes], "little")
         base_pkt = base // PAYLOAD if base < self.size else self.npkts
         if base_pkt > self.ack_base_pkt or bm != self.ack_bitmap:
-            self.last_progress = time.monotonic()
+            self.last_progress = self.last_advance = time.monotonic()
             self.rto = 0.1
         self.ack_base_pkt = base_pkt
         self.ack_bitmap = bm
@@ -521,6 +547,9 @@ class Sender:
             if mono - self.last_ack_time > 15:
                 raise PxError("PS2 does not answer for 15 s (cable? console?); "
                               "run the same send again to resume")
+            if mono - self.last_advance > 15 and self.inflight:
+                raise PxError("the PS2 answers but takes no data for 15 s. Large UDP packets "
+                              "do not reach it: " + MTU_HINT)
             self._rate_tick(mono)
             if not self.quiet and now - last_print >= 0.5:
                 done = min(self.size, self.base_pkt * PAYLOAD)
