@@ -7,8 +7,10 @@
  * Threads (IOP: lower number = higher priority):
  *   SMAP RX      rx_prio (10)  frames -> fast path / ARP / ICMP / control mailbox
  *   ack          12            periodic and on-demand ACKs
+ *   control      18            commands, FatFs, benches, start-up; above the
+ *                              writer so ls/stat answer during a transfer
+ *                              (at 30 it starved: the IOP is ~100 % busy)
  *   writer       20            full buffers -> disk
- *   control      30            commands, FatFs, benches, start-up
  *   rpc          40            SIF RPC: status for the EE (priority 14 hung the
  *                              IOP on a real PS2, 2026-11-22)
  *   idle         126           CPU load meter
@@ -152,7 +154,7 @@ int _start(int argc, char *argv[])
         start_thread(ack_thread, 12, 0x1000) < 0 ||
         (g_writer_tid = start_thread(writer_thread, 20, 0x1000)) < 0 ||
         start_thread(rpc_thread, 40, 0x1000) < 0 ||
-        start_thread(init_thread, 30, 0x2000) < 0)
+        start_thread(init_thread, 18, 0x2000) < 0)
         return MODULE_NO_RESIDENT_END;
 
     return MODULE_RESIDENT_END;
