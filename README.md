@@ -12,6 +12,12 @@ device). The disk stays in the console.
 * `ps2xfer.py` is the PC client: one Python file, standard library only,
   for Windows, Linux and WSL.
 
+![The ps2xfer window: games on the PS2 with cover preview](docs/img/window.png)
+
+| Sending a game | The PS2 screen (PCSX2) |
+|---|---|
+| ![Transfer queue and progress](docs/img/window-transfer.png) | ![ps2xfer on the PS2](docs/img/ps2-screen.png) |
+
 > **Status:** works on a real console. Tested on a fat PS2 with a 320 GB
 > disk (exFAT, formatted on the console): **9.5 MB/s sustained** with no lost
 > packets (the IOP is the limit, see `docs/BENCHMARKS.md`), games of 8 GiB,
