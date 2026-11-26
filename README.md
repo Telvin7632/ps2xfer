@@ -66,9 +66,17 @@ Enter the PS2's IP (or leave it empty to find it by broadcast) and press
 * Middle: the games with their ID, size, whether a cover is on the PS2 and the
   date. Click a column to sort, type in **Search** to filter. Right-click,
   `Del`, `F2` (rename), `F5` (refresh).
+* Right: the **cover** of the selected game (from `ART/` on the PS2, cached
+  in `~/.ps2xfer/covers`; during a transfer from the internet source).
 * **+ Add games** / **Add folder**, or **drop .iso files on the window**:
-  they go to `DVD/` or `CD/` with OPL names. **Verify after sending** and
-  **Download cover art** apply to each file as it starts.
+  they go to `DVD/` or `CD/`. **OPL names** gives them the
+  `SLUS_xxx.xx.Name.iso` form OPL needs on the HDD; **Verify after sending**
+  and **Download cover art** apply to each file as it starts.
+* **Rename games for OPL automatically** (menu PS2, on by default): ISOs in
+  `DVD/` and `CD/` with plain names (copied with Explorer or another tool) get
+  the OPL form as soon as the list is shown; the game ID is read from
+  `SYSTEM.CNF` inside the image. Switched off, a yellow bar offers
+  **Rename for OPL** instead.
 * **Transfers**: the queue with the state of each file (waiting, sending,
   verifying, cover art, done, failed), the current file's progress, speed and
   time left, and the whole queue's progress. **Cancel** stops; the file

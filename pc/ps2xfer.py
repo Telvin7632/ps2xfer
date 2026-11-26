@@ -827,35 +827,51 @@ def opl_old_name(dest: str, gid: str | None) -> str:
     return f"{folder}/{gid}.{name}"
 
 
+def opl_needs_name(name: str) -> bool:
+    """An ISO whose name OPL 1.2.0-Beta-2271 does not list from the HDD."""
+    return name.lower().endswith(".iso") and not is_opl_old_name(name)
+
+
+def opl_fix_names(c: Conn, folders=("/CD", "/DVD"), dry_run: bool = False, log=print,
+                  skip: set | None = None) -> list[tuple[str, str]]:
+    """Renames ISOs to OPL's old format SLUS_205.52.Name.iso (game ID from
+    SYSTEM.CNF inside the image). skip: PS2 paths known to have no game ID;
+    new ones are added. Returns [(old, new)]."""
+    done = []
+    for folder in folders:
+        for n in ps2_listdir(c, folder):
+            path = f"{folder}/{n}"
+            if not opl_needs_name(n) or (skip is not None and path in skip):
+                continue
+            gid = remote_game_id(c, path)
+            if gid is None:
+                log(f"  {path}: no game ID found, left as is")
+                if skip is not None:
+                    skip.add(path)
+                continue
+            new = f"{folder}/{gid}.{n}"
+            if dry_run:
+                log(f"  would rename {path} -> {new}")
+                continue
+            try:
+                c.call(T_RENAME, Conn.path(path) + Conn.path(new))
+            except PxError as e:
+                log(f"  {path}: {e}")
+                if skip is not None:
+                    skip.add(path)
+                continue
+            log(f"  {path} -> {new}")
+            done.append((path, new))
+    return done
+
+
 def cmd_opl_rename(args):
     """Renames ISOs in /CD and /DVD to OPL's old format SLUS_205.52.Name.iso.
     Works around OPL 1.2.0-Beta-2271 not listing new-format ISO names from
     the internal HDD (BDM ATA) while listing them from USB."""
     c = connect(args)
-    for folder in ("/CD", "/DVD"):
-        try:
-            r = c.call(T_LIST, struct.pack("<I", 0) + Conn.path(folder))
-        except PxError:
-            continue
-        nxt, count, _ = struct.unpack_from("<IHH", r)
-        pos, names = 8, []
-        for _ in range(count):
-            size, ft, attr, nl = struct.unpack_from("<QIBB", r, pos)
-            names.append(r[pos + 14:pos + 14 + nl].decode("utf-8", "replace"))
-            pos += 14 + nl
-        for n in names:
-            if not n.lower().endswith(".iso") or is_opl_old_name(n):
-                continue
-            gid = remote_game_id(c, f"{folder}/{n}")
-            if gid is None:
-                print(f"  {folder}/{n}: no game ID found, left as is")
-                continue
-            new = f"{folder}/{gid}.{n}"
-            if args.dry_run:
-                print(f"  would rename {folder}/{n} -> {new}")
-            else:
-                c.call(T_RENAME, Conn.path(f"{folder}/{n}") + Conn.path(new))
-                print(f"  {folder}/{n} -> {new}")
+    if not opl_fix_names(c, dry_run=args.dry_run) and not args.dry_run:
+        print("  nothing to rename")
 
 
 # --------------------------------------------------------------- OPL art
@@ -1737,6 +1753,88 @@ def _win_enable_drop(root, on_files) -> bool:
         return False
 
 
+def _png_rgba(w: int, h: int, rows: list[bytes]) -> bytes:
+    """Minimal PNG encoder (8-bit RGBA rows) for Tk's PhotoImage."""
+    import zlib
+    raw = b"".join(b"\0" + r for r in rows)
+
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0)) +
+            chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
+
+
+_GDIP_TOKEN = None
+
+
+def _win_cover_png(data: bytes, max_w: int, max_h: int) -> bytes | None:
+    """JPG/PNG cover -> PNG scaled to fit max_w x max_h, decoded by Windows'
+    own GDI+ (ctypes; Tk alone cannot read JPG). None if it fails."""
+    global _GDIP_TOKEN
+    import ctypes
+    from ctypes import byref, c_int, c_uint, c_void_p
+    gdip, shlwapi = ctypes.windll.gdiplus, ctypes.windll.shlwapi
+    if _GDIP_TOKEN is None:
+        class StartupInput(ctypes.Structure):
+            _fields_ = [("version", c_uint), ("callback", c_void_p), ("no_thread", c_int), ("no_codecs", c_int)]
+        tok = ctypes.c_size_t()
+        if gdip.GdiplusStartup(byref(tok), byref(StartupInput(1, None, 0, 0)), None) != 0:
+            return None
+        _GDIP_TOKEN = tok
+    shlwapi.SHCreateMemStream.restype = c_void_p
+    shlwapi.SHCreateMemStream.argtypes = [ctypes.c_char_p, c_uint]
+    stream = shlwapi.SHCreateMemStream(data, len(data))
+    if not stream:
+        return None
+    img, bmp = c_void_p(), c_void_p()
+
+    class Rect(ctypes.Structure):
+        _fields_ = [("x", c_int), ("y", c_int), ("w", c_int), ("h", c_int)]
+
+    class BitmapData(ctypes.Structure):
+        _fields_ = [("w", c_uint), ("h", c_uint), ("stride", c_int), ("fmt", c_int), ("scan0", c_void_p),
+                    ("reserved", ctypes.c_size_t)]
+    try:
+        if gdip.GdipCreateBitmapFromStream(c_void_p(stream), byref(img)) != 0:
+            return None
+        w, h = c_uint(), c_uint()
+        gdip.GdipGetImageWidth(img, byref(w))
+        gdip.GdipGetImageHeight(img, byref(h))
+        if not w.value or not h.value:
+            return None
+        k = min(max_w / w.value, max_h / h.value)
+        tw, th = max(1, round(w.value * k)), max(1, round(h.value * k))
+        argb = 0x26200A                       # PixelFormat32bppARGB
+        if gdip.GdipCreateBitmapFromScan0(tw, th, 0, argb, None, byref(bmp)) != 0:
+            return None
+        g = c_void_p()
+        if gdip.GdipGetImageGraphicsContext(bmp, byref(g)) != 0:
+            return None
+        gdip.GdipSetInterpolationMode(g, 7)    # high quality bicubic
+        gdip.GdipDrawImageRectI(g, img, 0, 0, tw, th)
+        gdip.GdipDeleteGraphics(g)
+        bd = BitmapData()
+        if gdip.GdipBitmapLockBits(bmp, byref(Rect(0, 0, tw, th)), 1, argb, byref(bd)) != 0:
+            return None
+        rows = []
+        for y in range(th):
+            bgra = ctypes.string_at(bd.scan0 + y * bd.stride, tw * 4)
+            rgba = bytearray(bgra)
+            rgba[0::4], rgba[2::4] = bgra[2::4], bgra[0::4]
+            rows.append(bytes(rgba))
+        gdip.GdipBitmapUnlockBits(bmp, byref(bd))
+        return _png_rgba(tw, th, rows)
+    except Exception:
+        return None
+    finally:
+        if bmp:
+            gdip.GdipDisposeImage(bmp)
+        if img:
+            gdip.GdipDisposeImage(img)
+        vtbl = ctypes.cast(stream, ctypes.POINTER(ctypes.POINTER(c_void_p))).contents
+        ctypes.WINFUNCTYPE(ctypes.c_ulong, c_void_p)(vtbl[2])(stream)   # IUnknown::Release
+
+
 ICON_PNG64 = (
     "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAEFUlEQVR42u2b2U5TURSGfYM+gYLzgFhHELzoG8ggqDjgrKjMOKJS"
     "vVbTCxMo6AOYGElMFHFITqJeeeONRhBBARkVKpRJjFmudaIEWIWz2p69Wwo7+ZKTrH3O/v8v0PSiZ9GihbWwRGvHjREn4kYMxIdA"
@@ -1785,7 +1883,7 @@ def cmd_gui(args):
     def px(v):
         return int(v * k)
 
-    root.geometry(cfg.get("geometry") or f"{px(1060)}x{px(720)}")
+    root.geometry(cfg.get("geometry") or f"{px(1100)}x{px(760)}")
     try:
         root.iconphoto(True, tk.PhotoImage(data=ICON_PNG64))
     except tk.TclError:
@@ -1847,7 +1945,8 @@ def cmd_gui(args):
     ui_q: "queue.Queue" = queue.Queue()      # callables for the Tk thread
     work_q: "queue.Queue" = queue.Queue()    # (description, callable) for the worker
     state = {"conn": None, "busy": False, "items": [], "covers": set(), "sort": ("name", False),
-             "batch_total": 0, "batch_done": 0, "cur_q": None}
+             "batch_total": 0, "batch_done": 0, "folder": "/DVD", "plain": 0, "no_id": set(),
+             "opl_auto": cfg.get("opl_auto", True)}
 
     def ui(fn, *a):
         ui_q.put(lambda: fn(*a))
@@ -1859,6 +1958,10 @@ def cmd_gui(args):
     m_ps2.add_command(label="Refresh", accelerator="F5", command=lambda: refresh())
     m_ps2.add_separator()
     m_ps2.add_command(label="Download missing art for all games", command=lambda: download_art())
+    m_ps2.add_command(label="Rename games for OPL now", command=lambda: fix_names())
+    opl_auto_var = tk.BooleanVar(value=state["opl_auto"])
+    m_ps2.add_checkbutton(label="Rename games for OPL automatically", variable=opl_auto_var,
+                          command=lambda: set_opl_auto())
     m_ps2.add_separator()
     m_ps2.add_command(label="Exit ps2xfer on the PS2...", command=lambda: exit_ps2())
     menu.add_cascade(label="PS2", menu=m_ps2)
@@ -1922,9 +2025,11 @@ def cmd_gui(args):
     cancel_btn = ttk.Button(top_row, text="Cancel", command=lambda: cancel(), state="disabled")
     cancel_btn.pack(side="right")
     ttk.Button(top_row, text="Clear finished", command=lambda: clear_finished()).pack(side="right", padx=px(6))
+    opl_var = tk.BooleanVar(value=cfg.get("opl_names", True))
     ttk.Checkbutton(top_row, text="Download cover art", variable=art_var).pack(side="right", padx=px(10))
     ttk.Checkbutton(top_row, text="Verify after sending", variable=verify_var).pack(side="right")
-    qtree = ttk.Treeview(xfer, columns=("size", "status"), height=4, selectmode="none")
+    ttk.Checkbutton(top_row, text="OPL names (SLUS_xxx.xx.)", variable=opl_var).pack(side="right", padx=(0, px(10)))
+    qtree = ttk.Treeview(xfer, columns=("size", "status"), height=3, selectmode="none")
     qtree.heading("#0", text="File", anchor="w")
     qtree.heading("size", text="Size", anchor="e")
     qtree.heading("status", text="Status", anchor="w")
@@ -1991,6 +2096,23 @@ def cmd_gui(args):
     filter_var.trace_add("write", on_filter)
     fentry.bind("<Escape>", lambda e: filter_var.set(""))
 
+    NOTE_BG, NOTE_FG = "#fef3c7", "#92400e"
+    notice = tk.Frame(main, bg=NOTE_BG, padx=px(10), pady=px(6))
+    notice_var = tk.StringVar()
+    tk.Label(notice, textvariable=notice_var, bg=NOTE_BG, fg=NOTE_FG, font=F).pack(side="left")
+    ttk.Button(notice, text="Rename for OPL", command=lambda: fix_names()).pack(side="right")
+    CW, CH = px(150), px(214)                    # cover preview box (OPL covers are ~0.7:1)
+    preview = ttk.Frame(main, style="Card.TFrame", padding=px(10))
+    cover = tk.Canvas(preview, width=CW, height=CH, bg="#eef0f3", highlightthickness=0)
+    cover.pack()
+    cover_txt = cover.create_text(CW // 2, CH // 2, text="", fill=DIM, font=F_S, width=CW - px(20),
+                                  justify="center")
+    cover_img = cover.create_image(CW // 2, CH // 2, anchor="center")
+    p_title = ttk.Label(preview, style="Head.TLabel", wraplength=CW, justify="left")
+    p_title.pack(anchor="w", pady=(px(8), 0))
+    p_info = ttk.Label(preview, style="Dim.TLabel", wraplength=CW, justify="left")
+    p_info.pack(anchor="w")
+    preview.pack(side="right", fill="y", padx=(px(8), 0))
     table_frame = ttk.Frame(main)
     table_frame.pack(fill="both", expand=True)
     cols = ("id", "size", "art", "date")
@@ -2000,7 +2122,7 @@ def cmd_gui(args):
     for c, t in heads.items():
         tree.heading(c, text=t, anchor="e" if c == "size" else "w",
                      command=lambda c=c: sort_by(keys[c]))
-    tree.column("#0", width=px(420), stretch=True)
+    tree.column("#0", width=px(260), minwidth=px(160), stretch=True)
     tree.column("id", width=px(110), stretch=False)
     tree.column("size", width=px(90), anchor="e", stretch=False)
     tree.column("art", width=px(60), anchor="center", stretch=False)
@@ -2134,7 +2256,7 @@ def cmd_gui(args):
         a.verify = verify_var.get()
         a.verify_full = False
         a.no_art = not art_var.get()
-        a.keep_name = False
+        a.keep_name = not opl_var.get()
         a.overwrite = False
         for key, v in kw.items():
             setattr(a, key, v)
@@ -2144,6 +2266,8 @@ def cmd_gui(args):
         cfg["verify"] = verify_var.get()
         cfg["art"] = art_var.get()
         cfg["show_log"] = show_log.get()
+        cfg["opl_names"] = opl_var.get()
+        cfg["opl_auto"] = state["opl_auto"]
         cfg["geometry"] = root.geometry()
         if len(sent_map) > 500:
             for key in list(sent_map)[:len(sent_map) - 500]:
@@ -2193,12 +2317,9 @@ def cmd_gui(args):
 
     # ---- the games table
     def folder():
-        sel = folders.selection()
-        return sel[0] if sel else "/DVD"
+        return state["folder"]      # kept by the Tk thread; the worker must not ask Tk
 
-    def list_folder():
-        fold = folder()
-        c = conn()
+    def read_items(c, fold):
         items, cursor = [], 0
         while True:
             r = c.call(T_LIST, struct.pack("<I", cursor) + Conn.path(fold))
@@ -2209,16 +2330,54 @@ def cmd_gui(args):
                 items.append((r[pos + 14:pos + 14 + nl].decode("utf-8", "replace"), size, attr, ft))
                 pos += 14 + nl
             if nxt == 0:
-                break
+                return items
             cursor = nxt
-        covers = set()
-        if fold in ("/DVD", "/CD"):
-            covers = {n[:11].upper() for n in ps2_listdir(c, "/ART") if n[11:16].upper() == "_COV."}
+
+    def list_folder():
+        fold = folder()
+        c = conn()
+        items = read_items(c, fold)
+        games_folder = fold in ("/DVD", "/CD")
+
+        def pending(its):
+            return [n for n, *_ in its if opl_needs_name(n) and f"{fold}/{n}" not in state["no_id"]]
+        if games_folder and state["opl_auto"] and pending(items):
+            log(f"renaming games in {fold} for OPL")
+            if opl_fix_names(c, (fold,), log=log, skip=state["no_id"]):
+                items = read_items(c, fold)
+        covers = {}
+        if games_folder:      # game ID -> its cover file in /ART
+            covers = {n[:11].upper(): n for n in ps2_listdir(c, "/ART") if n[11:16].upper() == "_COV."}
+        plain = len(pending(items)) if games_folder else 0
 
         def f():
-            state["items"], state["covers"], state["listed"] = items, covers, fold
+            state["items"], state["covers"], state["listed"], state["plain"] = items, covers, fold, plain
             fill_table()
+            show_notice()
         ui_q.put(f)
+
+    def show_notice():
+        if state["plain"] and not state["opl_auto"]:
+            notice_var.set(f"{state['plain']} game(s) here have names OPL does not list from the HDD "
+                           f"(it wants SLUS_xxx.xx.Name.iso).")
+            notice.pack(fill="x", pady=(0, px(8)), before=preview)
+        else:
+            notice.pack_forget()
+
+    def set_opl_auto():
+        state["opl_auto"] = opl_auto_var.get()
+        if state["opl_auto"] and state["conn"] is not None:
+            refresh()
+        else:
+            show_notice()
+
+    def fix_names():
+        def fn():
+            done = opl_fix_names(conn(), log=log, skip=state["no_id"])
+            log(f"renamed {len(done)} game(s) for OPL")
+            ui(status_var.set, f"Renamed {len(done)} game(s) for OPL")
+            list_folder()
+        job("Renaming games for OPL...", fn)
 
     def fill_table():
         fold = state.get("listed", folder())
@@ -2275,6 +2434,7 @@ def cmd_gui(args):
         job("Listing...", list_folder)
 
     def on_select(*_):
+        show_preview()
         n = len(tree.selection())
         for b in sel_buttons:
             b.configure(state="normal" if n else "disabled")
@@ -2282,6 +2442,114 @@ def cmd_gui(args):
             sel_buttons[0].configure(state="disabled")    # Rename: one at a time
 
     tree.bind("<<TreeviewSelect>>", on_select)
+
+    # ---- cover preview (own thread and own PS2 session; JPG decoded by GDI+)
+    cover_dir = os.path.join(os.path.expanduser("~"), ".ps2xfer", "covers")
+    cover_imgs: dict = {}            # game ID -> PhotoImage, or None = no cover anywhere
+    cover_q: "queue.Queue" = queue.Queue()
+
+    def show_preview():
+        fold = state.get("listed", folder())
+        if fold not in ("/DVD", "/CD"):
+            preview.pack_forget()
+            return
+        if not preview.winfo_ismapped():
+            preview.pack(side="right", fill="y", padx=(px(8), 0), before=table_frame)
+        sel = tree.selection()
+        row = next((i for i in state["items"] if len(sel) == 1 and i[0] == sel[0]), None)
+        cover.itemconfigure(cover_img, image="")
+        if row is None:
+            cover.itemconfigure(cover_txt, text="Select a game to see its cover" if not sel else "")
+            p_title.configure(text=f"{len(sel)} selected" if len(sel) > 1 else "")
+            total = sum(i[1] for i in state["items"] if i[0] in sel)
+            p_info.configure(text=fmt_size(total) if len(sel) > 1 else "")
+            return
+        name, size, attr, ft = row
+        gid = name[:11].upper() if is_opl_old_name(name) else ""
+        p_title.configure(text=name[12:].rsplit(".", 1)[0] if gid else name)
+        p_info.configure(text="  ·  ".join(x for x in (gid, fmt_size(size)) if x))
+        if not gid:
+            cover.itemconfigure(cover_txt, text="No game ID in the name")
+            return
+        if gid in cover_imgs:
+            set_cover(gid, cover_imgs[gid])
+            return
+        cover.itemconfigure(cover_txt, text="Loading cover...")
+        cover_q.put((gid, state["covers"].get(gid), state["busy"]))
+
+    def set_cover(gid, img):
+        cover_imgs[gid] = img
+        sel = tree.selection()
+        if len(sel) != 1 or sel[0][:11].upper() != gid:
+            return                       # the selection moved on meanwhile
+        if img is None:
+            cover.itemconfigure(cover_txt, text="No cover found\n\nGet art downloads it")
+            cover.itemconfigure(cover_img, image="")
+        else:
+            cover.itemconfigure(cover_txt, text="")
+            cover.itemconfigure(cover_img, image=img)
+
+    def cover_png(data):
+        if sys.platform == "win32":
+            return _win_cover_png(data, CW, CH)
+        return data if data[:8] == b"\x89PNG\r\n\x1a\n" else None    # Tk reads PNG, not JPG
+
+    def make_image(png):
+        import base64
+        img = tk.PhotoImage(data=base64.b64encode(png).decode())
+        if sys.platform != "win32":      # unscaled PNG: shrink by an integer factor
+            f = max(1, -(-img.width() // CW), -(-img.height() // CH))
+            if f > 1:
+                img = img.subsample(f)
+        return img
+
+    def cover_loader():
+        c2 = None
+        while True:
+            gid, fname, busy = cover_q.get()
+            if not cover_q.empty():
+                continue                 # only the newest selection matters
+            data = None
+            cached = [f for f in (os.listdir(cover_dir) if os.path.isdir(cover_dir) else [])
+                      if f.upper().startswith(gid + "_COV.")]
+            if cached:
+                with open(os.path.join(cover_dir, cached[0]), "rb") as f:
+                    data = f.read()
+            if data is None and fname and not busy and state["conn"] is not None:
+                try:                     # from /ART on the PS2 (not during a transfer)
+                    if c2 is None or c2.host != state["conn"].host:
+                        c2 = Conn(state["conn"].host, args.port)
+                        c2.hello()
+                    buf = bytearray()
+                    Downloader(c2, "/ART/" + fname, buf.extend, quiet=True).run()
+                    data = bytes(buf)
+                except (PxError, OSError):
+                    c2, data = None, None
+            if data is None:             # the same sources art_for_game uses
+                try:
+                    r = fetch_art(gid, "COV")
+                except Exception:
+                    r = None
+                if r:
+                    data, ext = r
+                    fname = f"{gid}_COV.{ext}"
+            if data is not None and not cached:
+                try:
+                    os.makedirs(cover_dir, exist_ok=True)
+                    with open(os.path.join(cover_dir, fname or f"{gid}_COV.jpg"), "wb") as f:
+                        f.write(data)
+                except OSError:
+                    pass
+            png = cover_png(data) if data else None
+
+            def done(gid=gid, png=png):
+                try:
+                    set_cover(gid, make_image(png) if png else None)
+                except tk.TclError:
+                    set_cover(gid, None)
+            ui_q.put(done)
+
+    threading.Thread(target=cover_loader, daemon=True).start()
 
     def popup(e):
         iid = tree.identify_row(e.y)
@@ -2538,8 +2806,14 @@ def cmd_gui(args):
     root.protocol("WM_DELETE_WINDOW", on_close)
     folders.selection_set(cfg.get("folder", "/DVD") if cfg.get("folder") in ("/DVD", "/CD", "/ART", "/APPS", "/")
                           else "/DVD")
-    folders.bind("<<TreeviewSelect>>", lambda e: (cfg.__setitem__("folder", folder()),
-                                                   refresh() if state["conn"] else None))
+    def on_folder(_e=None):
+        sel = folders.selection()
+        state["folder"] = sel[0] if sel else "/DVD"
+        cfg["folder"] = state["folder"]
+        if state["conn"]:
+            refresh()
+    folders.bind("<<TreeviewSelect>>", on_folder)
+    state["folder"] = folders.selection()[0] if folders.selection() else "/DVD"
     fill_table()
     pump()
     if host_var.get():
