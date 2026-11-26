@@ -714,8 +714,10 @@ def plan_files(paths: list[str], dest: str | None) -> list[tuple[str, str, int]]
     return out
 
 
-def send_planned(c: Conn, args, files: list[tuple[str, str, int]], log=print) -> None:
-    """Sends planned files (see plan_files): OPL names, verify, art."""
+def send_planned(c: Conn, args, files: list[tuple[str, str, int]], log=print, stage=None) -> None:
+    """Sends planned files (see plan_files): OPL names, verify, art.
+    stage(src, ps2_path, what): "send", "verify", "art", "done" (for the window)."""
+    stage = stage or (lambda *a: None)
     for i, (src, dst, size) in enumerate(files, 1):
         _check_cancel()
         for w in opl_warnings(dst):
@@ -727,18 +729,22 @@ def send_planned(c: Conn, args, files: list[tuple[str, str, int]], log=print) ->
             dst = opl_old_name(dst, local_game_id(src))
         flags = OW_RESUME | (OW_OVERWRITE if args.overwrite else 0)
         label = f"[{i}/{len(files)}] {dst}"
+        stage(src, dst, "send")
         r = transfer(c, args, src, size, dst, flags, fingerprint(src), label)
         log(f"    {dst}: {fmt_size(r['bytes'])} in {r['seconds']:.1f} s = "
             f"{r['bytes'] / r['seconds'] / 1e6 if r['seconds'] else 0:.2f} MB/s, "
             f"{r['retransmits']} retransmits")
         if args.verify:
+            stage(src, dst, "verify")
             (verify_file_full if args.verify_full else verify_file)(c, src, dst)
         if not args.no_art and dst.lower().endswith((".iso", ".zso")):
             name = dst.rsplit("/", 1)[-1]
             gid = name[:11].upper() if is_opl_old_name(name) else local_game_id(src)
             if gid:
+                stage(src, dst, "art")
                 got = art_for_game(c, args, gid)
                 log(f"    art: {', '.join(got) if got else 'none found / already there'}")
+        stage(src, dst, "done")
 
 
 def cmd_send(args):
@@ -1168,8 +1174,14 @@ def verify_file(c: Conn, src: str, dst: str):
         if cnt == 0:
             raise PxError("VERIFY: PS2 returned no data")
         done += cnt
+        _check_cancel()
         sys.stdout.write(f"\r    verify {100 * done // nblocks}%")
         sys.stdout.flush()
+        if PROGRESS_HOOK is not None:
+            el = max(time.monotonic() - t0, 1e-6)
+            nbytes = min(size, done << 20)
+            rate = nbytes / el
+            PROGRESS_HOOK(f"verify {dst}", nbytes, size, rate, rate, (size - nbytes) / rate if rate else 0, 0)
     print(f"\r    verify OK ({nblocks} MiB blocks, {time.monotonic() - t0:.1f} s)")
 
 
@@ -1660,13 +1672,98 @@ def bench_selftest(args):
 
 # --------------------------------------------------------------- GUI (tkinter)
 
+def _win_dpi_aware():
+    """Sharp text on scaled Windows displays (before the first window)."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        pass
+
+
+def _win_enable_drop(root, on_files) -> bool:
+    """Accept files dropped from Explorer on the window (Windows, ctypes only).
+    on_files(list_of_paths) runs INSIDE the window procedure, where Tk is busy
+    dispatching: it must not call tkinter (that is a fatal error), only hand
+    the list over, e.g. to a queue the Tk thread polls."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32, shell32 = ctypes.windll.user32, ctypes.windll.shell32
+        LRESULT = ctypes.c_ssize_t
+        WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+        user32.GetParent.restype = wintypes.HWND
+        user32.GetParent.argtypes = [wintypes.HWND]
+        user32.GetWindowLongPtrW.restype = ctypes.c_void_p
+        user32.GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.SetWindowLongPtrW.restype = ctypes.c_void_p
+        user32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+        user32.CallWindowProcW.restype = LRESULT
+        user32.CallWindowProcW.argtypes = [ctypes.c_void_p, wintypes.HWND, wintypes.UINT, wintypes.WPARAM,
+                                           wintypes.LPARAM]
+        shell32.DragQueryFileW.restype = wintypes.UINT
+        shell32.DragQueryFileW.argtypes = [ctypes.c_void_p, wintypes.UINT, ctypes.c_wchar_p, wintypes.UINT]
+        shell32.DragFinish.argtypes = [ctypes.c_void_p]
+        shell32.DragAcceptFiles.argtypes = [wintypes.HWND, wintypes.BOOL]
+        WM_DROPFILES, GWLP_WNDPROC = 0x0233, -4
+
+        root.update_idletasks()
+        hwnd = user32.GetParent(root.winfo_id()) or root.winfo_id()
+        old = user32.GetWindowLongPtrW(hwnd, GWLP_WNDPROC)
+
+        def proc(h, msg, wp, lp):
+            if msg == WM_DROPFILES:
+                files = []
+                n = shell32.DragQueryFileW(wp, 0xFFFFFFFF, None, 0)
+                for i in range(n):
+                    ln = shell32.DragQueryFileW(wp, i, None, 0)
+                    buf = ctypes.create_unicode_buffer(ln + 1)
+                    shell32.DragQueryFileW(wp, i, buf, ln + 1)
+                    files.append(buf.value)
+                shell32.DragFinish(wp)
+                on_files(files)
+                return 0
+            return user32.CallWindowProcW(old, h, msg, wp, lp)
+
+        root._px_drop_proc = WNDPROC(proc)   # keep it alive
+        user32.SetWindowLongPtrW(hwnd, GWLP_WNDPROC, ctypes.cast(root._px_drop_proc, ctypes.c_void_p))
+        shell32.DragAcceptFiles(hwnd, True)
+        return True
+    except Exception:
+        return False
+
+
+ICON_PNG64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAEFUlEQVR42u2b2U5TURSGfYM+gYLzgFhHELzoG8ggqDjgrKjMOKJS"
+    "vVbTCxMo6AOYGElMFHFITqJeeeONRhBBARkVKpRJjFmudaIEWIWz2p69Wwo7+ZKTrH3O/v8v0PSiZ9GihbWwRGvHjREn4kYMxIdA"
+    "lOH7l40yOm0rnnp92IUYCMwxKLMrnOIOxDMHi0+HOjiCKp/iHnIg7xCIEaiLTEJKBZavwBsq8MbYgjpZS9h+ze9BIEbxzF7+qt+F"
+    "QIwz8wdj8pVBA4EYxwhcvnzQiYBK0m/6obP/D8y0aEZ7VOegrkxA0uUBNwIqqXk5BlaL9qjOQV0DCTDmkQD+b7Dt0k8fAiqpeTFq"
+    "LQD3qM5BXbmAizhQjFiAhixMwNYLPlBN9XNrAbRHRxYu4DwOFCMWoCELE7DlXD+opvrZiLUA3KMjCxdQhgPFiAVoyMIEbC7rA9V4"
+    "BQJoj44sXEApDhTjrRcIwD06sjABm0p+gGq89cMCAcOgIwsXUIwDxXifCgTgHh1ZmICNRd9BNVUCAbRHRxYuoBAHiqmqEwjAPTqy"
+    "MAHOgl5QTVXdkEDAEOjIwgXk40AxVU8EAnCPjixMwIb8HlBNpUAA7dGRhQs4iwPFiAVoyMIEJJ7phlAo9Pqg8rFfxNvGX5YCaI/0"
+    "eXR2qLm5gNM4CIHU0h742DYOuhedSWeHmpsJWJ/XBaGSUtKtVQKdRWeGk5kLOIWDMEgp1iPBLI9nhZuXCUg42Qnhsr24S6kEejad"
+    "YUdWJQJMCUVqJJjli+wpH1DAuhMdYBfJhZ22SqBn0TPtzMgFHMeBjSQXoITW8CXQM+hZdudjAtYe+wZ2k5TfAbVvhkIuT/fSM1Rk"
+    "4wKO4kARoUige1RmYgLWHGkHldS+lkugvarzcAGHcaAYiQSzvIYsTMDqQ22gg9kk0ExXjogJmEmCzvIBBazKbQWdPHzlnyhP17rP"
+    "5wIO4kAzVNwsH4GzmYCVB77CfIIL2I+DeQQTsGLfF5hPcAE5OAiCvNs90N77GyK9KANlCTY/E7A8pwWknLrVDdG2KFMwHbiAvS0+"
+    "BCS0945HtOy9R30mU/8SxkGan7oyAcv2NBsISIjkct/tgcU7G0zoevKS5qeuXMDuZjcCEiK5sstbJwTQ9RQBwvzUlQlYmv3ZiYCE"
+    "SK73zaOQkPPJhK4nL2l+6hrw98JLsz4bCFjxwBiIug9ByiTJTh1n/LV4fFaTK35XE1iRmNsMH1rGoqY8ZaFMkuzUcdZ3BuIzmzwI"
+    "SCi70w2e+30RhTJI81I3yzdG4jI/OZB3CMQY1En23lBcBkrIwBsy8MbYgLoE9+bYkvRGB+JBYI5DHYIrP0VEWqMLMRCYY1Dm0F+c"
+    "nL4WpzU4ETd+ATEQ3/8vI1GEz8xGGTHrwsvOC0u2/gKAJQgpSncQsQAAAABJRU5ErkJggg==")
+
+
 def cmd_gui(args):
-    """Window for everyday use: list, send (queue), delete, rename, copy to
-    the PC, art, with progress. All PS2 work runs on one worker thread."""
+    """Window for everyday use: games on the PS2, a send queue with progress,
+    rename/delete/copy back/verify/art. All PS2 work runs on one worker thread;
+    the Tk thread only draws."""
     import json
     import queue
     import threading
     import tkinter as tk
+    import tkinter.font as tkfont
     from tkinter import filedialog, messagebox, simpledialog, ttk
 
     global PROGRESS_HOOK, CANCEL
@@ -1677,69 +1774,256 @@ def cmd_gui(args):
             cfg = json.load(f)
     except (OSError, ValueError):
         cfg = {}
+    sent_map = cfg.setdefault("sent", {})     # PS2 path -> local source (for Verify)
 
+    _win_dpi_aware()
     root = tk.Tk()
-    root.title(f"ps2xfer {VERSION}")
-    root.geometry("900x620")
-    ui_q: "queue.Queue" = queue.Queue()      # callables to run on the UI thread
+    root.title("ps2xfer")
+    root.minsize(860, 600)
+    k = root.winfo_fpixels("1i") / 96.0       # pixel sizes follow the display scale
+
+    def px(v):
+        return int(v * k)
+
+    root.geometry(cfg.get("geometry") or f"{px(1060)}x{px(720)}")
+    try:
+        root.iconphoto(True, tk.PhotoImage(data=ICON_PNG64))
+    except tk.TclError:
+        pass
+
+    # ---- look
+    BG, CARD, LINE = "#f3f4f6", "#ffffff", "#e2e5ea"
+    TEXT, DIM = "#1f2328", "#6b7280"
+    ACCENT, ACCENT_D, SEL = "#2563eb", "#1d4ed8", "#dbe7fe"
+    OK, WARN, BAD = "#15803d", "#b45309", "#b91c1c"
+    family = "Segoe UI" if sys.platform == "win32" else tkfont.nametofont("TkDefaultFont").actual("family")
+    F = (family, 10)
+    F_B = (family, 10, "bold")
+    F_S = (family, 9)
+    F_T = (family, 16, "bold")
+    root.configure(bg=BG)
+    st = ttk.Style(root)
+    st.theme_use("clam")
+    st.configure(".", background=BG, foreground=TEXT, font=F, bordercolor=LINE, focuscolor=ACCENT)
+    st.configure("TFrame", background=BG)
+    st.configure("Card.TFrame", background=CARD)
+    st.configure("TLabel", background=BG)
+    st.configure("Card.TLabel", background=CARD)
+    st.configure("Dim.TLabel", background=CARD, foreground=DIM, font=F_S)
+    st.configure("Head.TLabel", background=CARD, font=F_B)
+    st.configure("Title.TLabel", background=CARD, font=F_T)
+    st.configure("Side.TLabel", background=BG, foreground=DIM, font=(family, 8, "bold"))
+    st.configure("TButton", background=CARD, padding=(px(10), px(4)),
+                 lightcolor=CARD, darkcolor=CARD, bordercolor="#c9cfd8")
+    st.map("TButton", background=[("disabled", BG), ("pressed", LINE), ("active", "#eef2ff")],
+           foreground=[("disabled", "#a0a6b0")])
+    st.configure("Accent.TButton", background=ACCENT, foreground="#ffffff", bordercolor=ACCENT,
+                 lightcolor=ACCENT, darkcolor=ACCENT, font=F_B)
+    st.map("Accent.TButton", background=[("disabled", "#93b4f5"), ("pressed", ACCENT_D), ("active", ACCENT_D)],
+           foreground=[("disabled", "#ffffff")])
+    st.configure("TCheckbutton", background=CARD, indicatorbackground=CARD, indicatorforeground="#ffffff",
+                 indicatormargin=(0, 0, px(6), 0), upperbordercolor="#9aa3af", lowerbordercolor="#9aa3af")
+    st.map("TCheckbutton", background=[("active", CARD)],
+           indicatorbackground=[("selected", ACCENT), ("active", "#eef2ff")])
+    st.configure("TEntry", fieldbackground="#ffffff", padding=px(3))
+    st.configure("Treeview", background=CARD, fieldbackground=CARD, rowheight=px(26), bordercolor=LINE,
+                 lightcolor=LINE, darkcolor=LINE)
+    st.map("Treeview", background=[("selected", SEL)], foreground=[("selected", TEXT)])
+    st.configure("Treeview.Heading", background=BG, foreground=DIM, font=(family, 9, "bold"), relief="flat",
+                 bordercolor=LINE, lightcolor=BG, darkcolor=BG, padding=(px(6), px(4)))
+    st.map("Treeview.Heading", background=[("active", LINE)])
+    st.configure("Side.Treeview", background=BG, fieldbackground=BG, rowheight=px(30), borderwidth=0,
+                 lightcolor=BG, darkcolor=BG, bordercolor=BG, font=F)
+    st.layout("Side.Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
+    st.configure("Bar.Horizontal.TProgressbar", troughcolor="#e5e7eb", background=ACCENT, bordercolor="#e5e7eb",
+                 lightcolor=ACCENT, darkcolor=ACCENT, thickness=px(12))
+    st.configure("Verify.Horizontal.TProgressbar", troughcolor="#e5e7eb", background=OK, bordercolor="#e5e7eb",
+                 lightcolor=OK, darkcolor=OK, thickness=px(12))
+    st.configure("Thin.Horizontal.TProgressbar", troughcolor="#e5e7eb", background="#64748b",
+                 bordercolor="#e5e7eb", lightcolor="#64748b", darkcolor="#64748b", thickness=px(5))
+    st.configure("Disk.Horizontal.TProgressbar", troughcolor="#e5e7eb", background="#94a3b8",
+                 bordercolor="#e5e7eb", lightcolor="#94a3b8", darkcolor="#94a3b8", thickness=px(6))
+
+    ui_q: "queue.Queue" = queue.Queue()      # callables for the Tk thread
     work_q: "queue.Queue" = queue.Queue()    # (description, callable) for the worker
-    state = {"conn": None, "folder": "/DVD", "busy": False}
+    state = {"conn": None, "busy": False, "items": [], "covers": set(), "sort": ("name", False),
+             "batch_total": 0, "batch_done": 0, "cur_q": None}
 
     def ui(fn, *a):
         ui_q.put(lambda: fn(*a))
 
-    # ---- widgets
-    top = ttk.Frame(root, padding=6)
-    top.pack(fill="x")
-    ttk.Label(top, text="PS2 IP:").pack(side="left")
+    # ---- menu
+    menu = tk.Menu(root)
+    m_ps2 = tk.Menu(menu, tearoff=0)
+    m_ps2.add_command(label="Connect", command=lambda: do_connect())
+    m_ps2.add_command(label="Refresh", accelerator="F5", command=lambda: refresh())
+    m_ps2.add_separator()
+    m_ps2.add_command(label="Download missing art for all games", command=lambda: download_art())
+    m_ps2.add_separator()
+    m_ps2.add_command(label="Exit ps2xfer on the PS2...", command=lambda: exit_ps2())
+    menu.add_cascade(label="PS2", menu=m_ps2)
+    show_log = tk.BooleanVar(value=cfg.get("show_log", False))
+    m_view = tk.Menu(menu, tearoff=0)
+    m_view.add_checkbutton(label="Log", variable=show_log, command=lambda: place_log())
+    menu.add_cascade(label="View", menu=m_view)
+    root.configure(menu=menu)
+
+    # ---- header card
+    head = ttk.Frame(root, style="Card.TFrame", padding=(px(16), px(12)))
+    head.pack(fill="x")
+    ttk.Label(head, text="ps2xfer", style="Title.TLabel").grid(row=0, column=0, rowspan=2, sticky="w")
+    ttk.Label(head, text=f"v{VERSION}", style="Dim.TLabel").grid(row=0, column=1, rowspan=2, sticky="sw",
+                                                                 padx=(px(4), px(24)), pady=(0, px(5)))
+    dot = tk.Canvas(head, width=px(12), height=px(12), bg=CARD, highlightthickness=0)
+    dot.grid(row=0, column=2, sticky="w")
+    dot_id = dot.create_oval(1, 1, px(11), px(11), fill="#9ca3af", outline="")
+    conn_var = tk.StringVar(value="Not connected")
+    ttk.Label(head, textvariable=conn_var, style="Head.TLabel").grid(row=0, column=3, sticky="w", padx=px(6))
+    disk_var = tk.StringVar(value="Enter the PS2's IP (empty: search the network) and press Connect")
+    ttk.Label(head, textvariable=disk_var, style="Dim.TLabel").grid(row=1, column=2, columnspan=2, sticky="w")
+    head.columnconfigure(4, weight=1)
+    disk_bar = ttk.Progressbar(head, style="Disk.Horizontal.TProgressbar", maximum=1000, length=px(220))
+    disk_bar.grid(row=0, column=5, sticky="e", padx=(0, px(16)))
+    free_var = tk.StringVar(value="")
+    ttk.Label(head, textvariable=free_var, style="Dim.TLabel").grid(row=1, column=5, sticky="e", padx=(0, px(16)))
+    ttk.Label(head, text="PS2 IP", style="Dim.TLabel").grid(row=0, column=6, sticky="w")
     host_var = tk.StringVar(value=args.host or cfg.get("host", ""))
-    ttk.Entry(top, textvariable=host_var, width=16).pack(side="left", padx=4)
-    ttk.Button(top, text="Connect", command=lambda: do_connect()).pack(side="left")
-    status_var = tk.StringVar(value="Not connected (empty IP = find the PS2 by broadcast)")
-    ttk.Label(top, textvariable=status_var).pack(side="left", padx=10)
+    host_entry = ttk.Entry(head, textvariable=host_var, width=15)
+    host_entry.grid(row=1, column=6, sticky="w")
+    host_entry.bind("<Return>", lambda e: do_connect())
+    connect_btn = ttk.Button(head, text="Connect", style="Accent.TButton", command=lambda: do_connect())
+    connect_btn.grid(row=0, column=7, rowspan=2, padx=(px(8), 0))
+    tk.Frame(root, height=1, bg=LINE).pack(fill="x")
 
-    mid = ttk.Frame(root, padding=(6, 0))
-    mid.pack(fill="both", expand=True)
-    bar = ttk.Frame(mid)
-    bar.pack(fill="x", pady=4)
-    folder_var = tk.StringVar(value="/DVD")
-    fsel = ttk.Combobox(bar, textvariable=folder_var, values=["/DVD", "/CD", "/ART", "/"], width=8, state="readonly")
-    fsel.pack(side="left")
-    fsel.bind("<<ComboboxSelected>>", lambda e: refresh())
-    for text, cmd in (("Refresh", lambda: refresh()), ("Add games...", lambda: add_files()),
-                      ("Add folder...", lambda: add_folder()), ("Delete", lambda: delete()),
-                      ("Rename", lambda: rename()), ("Copy to PC...", lambda: copy_to_pc()),
-                      ("Download art", lambda: download_art())):
-        ttk.Button(bar, text=text, command=cmd).pack(side="left", padx=2)
-    verify_var = tk.BooleanVar(value=cfg.get("verify", False))
+    # ---- log (packed at the bottom when shown)
+    log_frame = ttk.Frame(root, style="Card.TFrame", padding=(px(12), px(6)))
+    log_box = tk.Text(log_frame, height=7, state="disabled", relief="flat", bg="#f8fafc", fg=TEXT,
+                      font=("Consolas" if sys.platform == "win32" else "TkFixedFont", 9),
+                      highlightthickness=1, highlightbackground=LINE)
+    log_box.pack(fill="both", expand=True)
+
+    # ---- status bar
+    status_var = tk.StringVar(value="Ready")
+    status = ttk.Frame(root, padding=(px(12), px(3)))
+    status.pack(side="bottom", fill="x")
+    ttk.Label(status, textvariable=status_var, foreground=DIM, font=F_S).pack(side="left")
+    ttk.Label(status, text="Drop .iso files on the window to send them" if sys.platform == "win32" else "",
+              foreground=DIM, font=F_S).pack(side="right")
+
+    # ---- transfer card
+    xfer = ttk.Frame(root, style="Card.TFrame", padding=(px(16), px(10)))
+    xfer.pack(side="bottom", fill="x")
+    tk.Frame(root, height=1, bg=LINE).pack(side="bottom", fill="x")
+    top_row = ttk.Frame(xfer, style="Card.TFrame")
+    top_row.pack(fill="x")
+    ttk.Label(top_row, text="Transfers", style="Head.TLabel").pack(side="left")
+    verify_var = tk.BooleanVar(value=cfg.get("verify", True))
     art_var = tk.BooleanVar(value=cfg.get("art", True))
-    ttk.Checkbutton(bar, text="Verify", variable=verify_var).pack(side="left", padx=6)
-    ttk.Checkbutton(bar, text="Art", variable=art_var).pack(side="left")
-
-    tree = ttk.Treeview(mid, columns=("id", "size"), selectmode="extended")
-    tree.heading("#0", text="Name")
-    tree.heading("id", text="Game ID")
-    tree.heading("size", text="Size")
-    tree.column("#0", width=560)
-    tree.column("id", width=110)
-    tree.column("size", width=100, anchor="e")
-    tree.pack(fill="both", expand=True)
-
-    bottom = ttk.Frame(root, padding=6)
-    bottom.pack(fill="x")
+    cancel_btn = ttk.Button(top_row, text="Cancel", command=lambda: cancel(), state="disabled")
+    cancel_btn.pack(side="right")
+    ttk.Button(top_row, text="Clear finished", command=lambda: clear_finished()).pack(side="right", padx=px(6))
+    ttk.Checkbutton(top_row, text="Download cover art", variable=art_var).pack(side="right", padx=px(10))
+    ttk.Checkbutton(top_row, text="Verify after sending", variable=verify_var).pack(side="right")
+    qtree = ttk.Treeview(xfer, columns=("size", "status"), height=4, selectmode="none")
+    qtree.heading("#0", text="File", anchor="w")
+    qtree.heading("size", text="Size", anchor="e")
+    qtree.heading("status", text="Status", anchor="w")
+    qtree.column("#0", width=px(560), stretch=True)
+    qtree.column("size", width=px(90), anchor="e", stretch=False)
+    qtree.column("status", width=px(220), stretch=False)
+    for tag, color in (("wait", DIM), ("run", ACCENT), ("ok", OK), ("bad", BAD)):
+        qtree.tag_configure(tag, foreground=color)
+    qtree.pack(fill="x", pady=(px(6), px(8)))
     cur_var = tk.StringVar(value="Idle")
-    ttk.Label(bottom, textvariable=cur_var).pack(anchor="w")
-    pbar = ttk.Progressbar(bottom, maximum=1000)
-    pbar.pack(fill="x", pady=2)
-    stat_var = tk.StringVar(value="")
-    row = ttk.Frame(bottom)
+    row = ttk.Frame(xfer, style="Card.TFrame")
     row.pack(fill="x")
-    ttk.Label(row, textvariable=stat_var).pack(side="left")
-    ttk.Button(row, text="Cancel", command=lambda: CANCEL.set()).pack(side="right")
-    ttk.Button(row, text="Exit ps2xfer on the PS2", command=lambda: exit_ps2()).pack(side="right", padx=4)
-    log_box = tk.Text(root, height=8, state="disabled")
-    log_box.pack(fill="x", padx=6, pady=(0, 6))
+    ttk.Label(row, textvariable=cur_var, style="Card.TLabel").pack(side="left")
+    speed_var = tk.StringVar(value="")
+    ttk.Label(row, textvariable=speed_var, style="Card.TLabel").pack(side="right")
+    pbar = ttk.Progressbar(xfer, style="Bar.Horizontal.TProgressbar", maximum=1000)
+    pbar.pack(fill="x", pady=(px(4), px(4)))
+    row2 = ttk.Frame(xfer, style="Card.TFrame")
+    row2.pack(fill="x")
+    total_var = tk.StringVar(value="")
+    ttk.Label(row2, textvariable=total_var, style="Dim.TLabel").pack(side="left")
+    tbar = ttk.Progressbar(row2, style="Thin.Horizontal.TProgressbar", maximum=1000, length=px(240))
+    tbar.pack(side="right", pady=px(2))
 
+    # ---- body: folders + games
+    body = ttk.Frame(root, padding=(0, 0))
+    body.pack(fill="both", expand=True)
+    side = ttk.Frame(body, padding=(px(10), px(10), px(4), px(10)))
+    side.pack(side="left", fill="y")
+    ttk.Label(side, text="ON THE PS2", style="Side.TLabel").pack(anchor="w", padx=px(6), pady=(0, px(4)))
+    folders = ttk.Treeview(side, style="Side.Treeview", show="tree", selectmode="browse", height=6)
+    folders.column("#0", width=px(150))
+    for iid, text in (("/DVD", "DVD games"), ("/CD", "CD games"), ("/ART", "Cover art"),
+                      ("/APPS", "Apps"), ("/", "All files")):
+        folders.insert("", "end", iid=iid, text="  " + text)
+    folders.pack(fill="y", expand=True)
+
+    main = ttk.Frame(body, padding=(px(6), px(10), px(12), px(8)))
+    main.pack(side="left", fill="both", expand=True)
+    tools = ttk.Frame(main)
+    tools.pack(fill="x", pady=(0, px(8)))
+    ttk.Button(tools, text="+  Add games", style="Accent.TButton", command=lambda: add_files()).pack(side="left")
+    ttk.Button(tools, text="Add folder", command=lambda: add_folder()).pack(side="left", padx=(px(6), px(14)))
+    sel_buttons = []
+    for text, cmd in (("Rename", lambda: rename()), ("Delete", lambda: delete()),
+                      ("Copy to PC", lambda: copy_to_pc()), ("Verify", lambda: verify_selected()),
+                      ("Get art", lambda: art_selected())):
+        b = ttk.Button(tools, text=text, command=cmd, state="disabled")
+        b.pack(side="left", padx=(0, px(4)))
+        sel_buttons.append(b)
+    filter_var = tk.StringVar()
+    fentry = ttk.Entry(tools, textvariable=filter_var, width=22)
+    fentry.pack(side="right")
+    hint = tk.Label(fentry, text="Search", fg="#9aa3af", bg="#ffffff", font=F)
+    hint.place(x=px(6), rely=0.5, anchor="w")
+    hint.bind("<Button-1>", lambda e: fentry.focus_set())
+
+    def on_filter(*_):
+        if filter_var.get():
+            hint.place_forget()
+        else:
+            hint.place(x=px(6), rely=0.5, anchor="w")
+        fill_table()
+    filter_var.trace_add("write", on_filter)
+    fentry.bind("<Escape>", lambda e: filter_var.set(""))
+
+    table_frame = ttk.Frame(main)
+    table_frame.pack(fill="both", expand=True)
+    cols = ("id", "size", "art", "date")
+    tree = ttk.Treeview(table_frame, columns=cols, selectmode="extended")
+    heads = {"#0": "Name", "id": "Game ID", "size": "Size", "art": "Cover", "date": "Date"}
+    keys = {"#0": "name", "id": "id", "size": "size", "art": "art", "date": "date"}
+    for c, t in heads.items():
+        tree.heading(c, text=t, anchor="e" if c == "size" else "w",
+                     command=lambda c=c: sort_by(keys[c]))
+    tree.column("#0", width=px(420), stretch=True)
+    tree.column("id", width=px(110), stretch=False)
+    tree.column("size", width=px(90), anchor="e", stretch=False)
+    tree.column("art", width=px(60), anchor="center", stretch=False)
+    tree.column("date", width=px(100), stretch=False)
+    tree.tag_configure("odd", background="#f9fafb")
+    tree.tag_configure("dir", foreground=ACCENT)
+    tree.tag_configure("other", foreground=DIM)
+    vsb = ttk.Scrollbar(table_frame, orient="vertical", command=tree.yview)
+    tree.configure(yscrollcommand=vsb.set)
+    vsb.pack(side="right", fill="y")
+    tree.pack(side="left", fill="both", expand=True)
+    empty_var = tk.StringVar(value="")
+    empty_lbl = tk.Label(table_frame, textvariable=empty_var, bg=CARD, fg=DIM, font=F)
+    empty_lbl.place(relx=0.5, rely=0.4, anchor="center")
+
+    ctx = tk.Menu(root, tearoff=0)
+    for text, cmd in (("Rename", lambda: rename()), ("Delete", lambda: delete()),
+                      ("Copy to PC...", lambda: copy_to_pc()), ("Verify against the PC file...",
+                                                                lambda: verify_selected()),
+                      ("Download art", lambda: art_selected())):
+        ctx.add_command(label=text, command=cmd)
+
+    # ---- log / progress plumbing
     def log(text):
         def f():
             log_box.configure(state="normal")
@@ -1748,13 +2032,30 @@ def cmd_gui(args):
             log_box.configure(state="disabled")
         ui_q.put(f)
 
+    def place_log():
+        if show_log.get():
+            log_frame.pack(side="bottom", fill="x", before=status)
+        else:
+            log_frame.pack_forget()
+
+    place_log()
+
     def progress(label, done, size, cur, avg, eta, retx):
         def f():
-            cur_var.set(label)
+            verifying = label.startswith("verify ")
+            name = label.split("/")[-1]
+            cur_var.set(("Verifying  " if verifying else "Copying  " if label.startswith("copy ")
+                         else "Sending  ") + name)
+            pbar.configure(style="Verify.Horizontal.TProgressbar" if verifying else "Bar.Horizontal.TProgressbar")
             pbar["value"] = 1000 * done / size if size else 0
             e = int(eta)
-            stat_var.set(f"{fmt_size(done)} / {fmt_size(size)}   {cur / 1e6:5.2f} MB/s (avg {avg / 1e6:5.2f})"
-                         f"   ETA {e // 3600}:{e // 60 % 60:02d}:{e % 60:02d}   retransmits {retx}")
+            pct = 100 * done / size if size else 0
+            speed_var.set(f"{pct:5.1f} %    {fmt_size(done)} of {fmt_size(size)}    {avg / 1e6:.1f} MB/s    "
+                          f"{e // 3600}:{e // 60 % 60:02d}:{e % 60:02d} left")
+            if not verifying and not label.startswith("copy ") and state["batch_total"]:
+                d = state["batch_done"] + done
+                tbar["value"] = 1000 * d / state["batch_total"]
+                total_var.set(f"Queue: {fmt_size(d)} of {fmt_size(state['batch_total'])}")
         ui_q.put(f)
 
     PROGRESS_HOOK = progress
@@ -1779,32 +2080,52 @@ def cmd_gui(args):
             pass
 
     sys.stdout = LogWriter()
+    if sys.stderr is None:          # the windowed .exe has no console
+        sys.stderr = sys.stdout
 
     # ---- worker
+    def set_busy(b):
+        state["busy"] = b
+        cancel_btn.configure(state="normal" if b else "disabled")
+
     def worker():
         while True:
             desc, fn = work_q.get()
             CANCEL.clear()
-            state["busy"] = True
-            ui(cur_var.set, desc)
+            ui(set_busy, True)
+            ui(status_var.set, desc)
             try:
                 fn()
             except PxError as e:
                 log(f"{desc}: {e}")
+                ui(status_var.set, f"{desc} {e}")
+                if str(e) != "cancelled" and not str(e).startswith("not connected"):
+                    ui(messagebox.showerror, "ps2xfer", f"{desc}\n\n{e}")
             except Exception as e:     # keep the window alive, show what happened
                 log(f"{desc}: {type(e).__name__}: {e}")
-            state["busy"] = False
+                ui(messagebox.showerror, "ps2xfer", f"{desc}\n\n{type(e).__name__}: {e}")
             if work_q.empty():
-                ui(cur_var.set, "Idle")
+                ui(set_busy, False)
+                ui(idle_view)
 
     threading.Thread(target=worker, daemon=True).start()
 
     def job(desc, fn):
         work_q.put((desc, fn))
 
+    def idle_view():
+        if not state["busy"]:
+            cur_var.set("Idle")
+            speed_var.set("")
+            pbar["value"] = 0
+            if all(qtree.item(i, "tags")[0] in ("ok", "bad") for i in qtree.get_children()):
+                state["batch_total"] = state["batch_done"] = 0
+                tbar["value"] = 0
+                total_var.set("")
+
     def conn():
         if state["conn"] is None:
-            raise PxError("not connected")
+            raise PxError("not connected: press Connect")
         return state["conn"]
 
     def run_args(**kw):
@@ -1815,92 +2136,290 @@ def cmd_gui(args):
         a.no_art = not art_var.get()
         a.keep_name = False
         a.overwrite = False
-        for k, v in kw.items():
-            setattr(a, k, v)
+        for key, v in kw.items():
+            setattr(a, key, v)
         return a
 
-    # ---- actions
+    def save_cfg():
+        cfg["verify"] = verify_var.get()
+        cfg["art"] = art_var.get()
+        cfg["show_log"] = show_log.get()
+        cfg["geometry"] = root.geometry()
+        if len(sent_map) > 500:
+            for key in list(sent_map)[:len(sent_map) - 500]:
+                del sent_map[key]
+        try:
+            with open(cfg_path, "w") as f:
+                json.dump(cfg, f)
+        except OSError:
+            pass
+
+    # ---- connection
+    def show_info(c):
+        i = c.info
+        ip = socket.inet_ntoa(struct.pack(">I", i["ip"]))
+        good = i["link"] & 0x0F == 8
+        dot.itemconfigure(dot_id, fill=OK if good else WARN)
+        conn_var.set(f"PS2 {ip}  ·  {link_text(i['link'])}")
+        disk_var.set(f"{i['model'] or 'disk ?'}  ·  ps2xfer {i['version']} on the PS2")
+        if i["fs_free_mb"] != M32 and i["fs_total_mb"]:
+            used = i["fs_total_mb"] - i["fs_free_mb"]
+            disk_bar["value"] = 1000 * used / i["fs_total_mb"]
+            free_var.set(f"{fmt_size(i['fs_free_mb'] << 20)} free of {fmt_size(i['fs_total_mb'] << 20)}")
+        host_var.set(c.host)
+        connect_btn.configure(text="Reconnect", style="TButton")
+
     def do_connect():
         h = host_var.get().strip() or None
 
         def fn():
             c = Conn(h, args.port)
-            i = c.hello()
+            c.hello()
             state["conn"] = c
-            ip = socket.inet_ntoa(struct.pack(">I", i["ip"]))
-            free = "?" if i["fs_free_mb"] == M32 else fmt_size(i["fs_free_mb"] << 20)
-            ui(status_var.set, f"PS2 {ip}: {link_text(i['link'])}, disk {i['model'] or '?'}, free {free}")
-            ui(host_var.set, c.host)
             cfg["host"] = c.host
-            log(f"connected to {ip} (ps2xfer {i['version']})")
+            ui(show_info, c)
+            log(f"connected to {c.host} (ps2xfer {c.info['version']})")
             list_folder()
+        conn_var.set("Connecting...")
         job("Connecting...", fn)
 
+    def update_free():
+        try:
+            total, free = struct.unpack_from("<QQ", conn().call(T_DF, timeout=30.0))
+            conn().info["fs_total_mb"], conn().info["fs_free_mb"] = total >> 20, free >> 20
+            ui(show_info, conn())
+        except (PxError, struct.error):
+            pass
+
+    # ---- the games table
+    def folder():
+        sel = folders.selection()
+        return sel[0] if sel else "/DVD"
+
     def list_folder():
-        folder = folder_var.get()
+        fold = folder()
         c = conn()
         items, cursor = [], 0
         while True:
-            r = c.call(T_LIST, struct.pack("<I", cursor) + Conn.path(folder))
+            r = c.call(T_LIST, struct.pack("<I", cursor) + Conn.path(fold))
             nxt, count, _ = struct.unpack_from("<IHH", r)
             pos = 8
             for _ in range(count):
                 size, ft, attr, nl = struct.unpack_from("<QIBB", r, pos)
-                items.append((r[pos + 14:pos + 14 + nl].decode("utf-8", "replace"), size, attr))
+                items.append((r[pos + 14:pos + 14 + nl].decode("utf-8", "replace"), size, attr, ft))
                 pos += 14 + nl
             if nxt == 0:
                 break
             cursor = nxt
+        covers = set()
+        if fold in ("/DVD", "/CD"):
+            covers = {n[:11].upper() for n in ps2_listdir(c, "/ART") if n[11:16].upper() == "_COV."}
 
         def f():
-            tree.delete(*tree.get_children())
-            for name, size, attr in sorted(items, key=lambda x: x[0].lower()):
-                shown, gid = name, ""
-                if is_opl_old_name(name):
-                    gid, shown = name[:11], name[12:]
-                tree.insert("", "end", iid=name, text=shown + ("/" if attr & 0x10 else ""),
-                            values=(gid, "" if attr & 0x10 else fmt_size(size)))
+            state["items"], state["covers"], state["listed"] = items, covers, fold
+            fill_table()
         ui_q.put(f)
+
+    def fill_table():
+        fold = state.get("listed", folder())
+        flt = filter_var.get().strip().lower()
+        rows = []
+        for name, size, attr, ft in state["items"]:
+            isdir = bool(attr & 0x10)
+            gid, shown = "", name
+            if is_opl_old_name(name):
+                gid, shown = name[:11].upper(), name[12:]
+            if flt and flt not in name.lower():
+                continue
+            d = ft >> 16
+            date = f"{1980 + (d >> 9)}-{(d >> 5) & 15:02d}-{d & 31:02d}" if d else ""
+            game = name.lower().endswith((".iso", ".zso"))
+            art = ("✓" if gid in state["covers"] else "–") if gid and fold in ("/DVD", "/CD") else ""
+            rows.append(dict(iid=name, name=shown.lower(), shown=shown, id=gid, size=-1 if isdir else size,
+                             art=art, date=date, isdir=isdir, game=game))
+        key, rev = state["sort"]
+        rows.sort(key=lambda r: (not r["isdir"], r[key] if key != "name" else r["name"]), reverse=rev)
+        if rev:
+            rows.sort(key=lambda r: not r["isdir"])
+        tree.delete(*tree.get_children())
+        for n, r in enumerate(rows):
+            tags = ["odd"] if n % 2 else []
+            if r["isdir"]:
+                tags.append("dir")
+            elif fold in ("/DVD", "/CD") and not r["game"]:
+                tags.append("other")
+            tree.insert("", "end", iid=r["iid"], text=("▸ " if r["isdir"] else "") + r["shown"],
+                        values=(r["id"], "" if r["isdir"] else fmt_size(r["size"]), r["art"], r["date"]),
+                        tags=tags)
+        games = sum(1 for r in rows if r["game"])
+        if state["conn"] is None:
+            empty_var.set("Not connected")
+        elif not rows:
+            empty_var.set("Empty here. Add games with the button above" +
+                          (" or drop .iso files on the window." if sys.platform == "win32" else "."))
+        else:
+            empty_var.set("")
+        if empty_var.get():
+            empty_lbl.place(relx=0.5, rely=0.4, anchor="center")
+        else:
+            empty_lbl.place_forget()
+        status_var.set(f"{fold}: {len(rows)} item(s)" + (f", {games} game(s)" if games else ""))
+        on_select()
+
+    def sort_by(key):
+        cur, rev = state["sort"]
+        state["sort"] = (key, not rev if cur == key else False)
+        fill_table()
 
     def refresh():
         job("Listing...", list_folder)
 
+    def on_select(*_):
+        n = len(tree.selection())
+        for b in sel_buttons:
+            b.configure(state="normal" if n else "disabled")
+        if n != 1:
+            sel_buttons[0].configure(state="disabled")    # Rename: one at a time
+
+    tree.bind("<<TreeviewSelect>>", on_select)
+
+    def popup(e):
+        iid = tree.identify_row(e.y)
+        if iid:
+            if iid not in tree.selection():
+                tree.selection_set(iid)
+            ctx.tk_popup(e.x_root, e.y_root)
+
+    tree.bind("<Button-3>", popup)
+    tree.bind("<Delete>", lambda e: delete())
+    tree.bind("<F2>", lambda e: rename())
+    tree.bind("<Double-1>", lambda e: open_dir(tree.identify_row(e.y)))
+    root.bind("<F5>", lambda e: refresh())
+    root.bind("<Control-o>", lambda e: add_files())
+
+    def open_dir(iid):
+        if not iid:
+            return
+        for name, size, attr, ft in state["items"]:
+            if name == iid and attr & 0x10:
+                path = (folder().rstrip("/") + "/" + name)
+                if path not in folders.get_children():
+                    folders.insert("", "end", iid=path, text="  " + path)
+                folders.selection_set(path)
+                return
+
+    # ---- send queue
+    def queue_status(qid, text, tag):
+        def f():
+            if qtree.exists(qid):
+                qtree.set(qid, "status", text)
+                qtree.item(qid, tags=(tag,))
+                qtree.see(qid)
+        ui_q.put(f)
+
     def add_paths(paths):
-        files = plan_files(paths, None)
-        a = run_args()
+        try:
+            files = plan_files(paths, None)
+        except PxError as e:
+            messagebox.showerror("ps2xfer", str(e))
+            return
+        if not files:
+            return
+        if state["conn"] is None:
+            messagebox.showinfo("ps2xfer", "Connect to the PS2 first.")
+            return
+        for src, dst, size in files:
+            qid = qtree.insert("", "end", text=f"{os.path.basename(src)}   →   {dst.rsplit('/', 1)[0]}/",
+                               values=(fmt_size(size), "Waiting"), tags=("wait",))
+            state["batch_total"] += size
+            job_send(qid, src, dst, size)
+        total_var.set(f"Queue: {fmt_size(state['batch_done'])} of {fmt_size(state['batch_total'])}")
         log(f"queued {len(files)} file(s), {fmt_size(sum(x[2] for x in files))}")
 
+    def job_send(qid, src, dst, size):
         def fn():
-            send_planned(conn(), a, files, log)
-            log("done")
-            list_folder()
-        job(f"Sending {len(files)} file(s)...", fn)
+            a = run_args()          # the check boxes as they are now, for this file
+
+            def stage(s, d, what):
+                sent_map[d] = s
+                text = {"send": "Sending", "verify": "Verifying", "art": "Getting cover art",
+                        "done": "Done" + (", verified" if a.verify else "")}[what]
+                queue_status(qid, text, "ok" if what == "done" else "run")
+            try:
+                send_planned(conn(), a, [(src, dst, size)], log, stage)
+            except PxError as e:
+                queue_status(qid, "Cancelled (resumes next time)" if str(e) == "cancelled" else f"Failed: {e}",
+                             "bad")
+                raise
+            finally:
+                state["batch_done"] += size
+            if work_q.empty():
+                list_folder()
+                update_free()
+        job(f"Sending {os.path.basename(src)}...", fn)
+
+    def cancel():
+        CANCEL.set()
+        while True:                    # drop what has not started yet
+            try:
+                work_q.get_nowait()
+            except queue.Empty:
+                break
+        for i in qtree.get_children():
+            if qtree.set(i, "status") == "Waiting":
+                qtree.set(i, "status", "Cancelled")
+                qtree.item(i, tags=("bad",))
+
+    def clear_finished():
+        for i in qtree.get_children():
+            if qtree.item(i, "tags")[0] in ("ok", "bad"):
+                qtree.delete(i)
+        if not qtree.get_children():
+            state["batch_total"] = state["batch_done"] = 0
+            tbar["value"] = 0
+            total_var.set("")
 
     def add_files():
         paths = filedialog.askopenfilenames(title="Games or files to send to the PS2",
+                                            initialdir=cfg.get("last_dir") or None,
                                             filetypes=[("PS2 games", "*.iso *.zso"), ("All files", "*.*")])
         if paths:
+            cfg["last_dir"] = os.path.dirname(paths[0])
             add_paths(list(paths))
 
     def add_folder():
-        d = filedialog.askdirectory(title="Folder: its .iso/.zso go to CD/DVD")
+        d = filedialog.askdirectory(title="Folder: its .iso/.zso go to CD/DVD",
+                                    initialdir=cfg.get("last_dir") or None)
         if d:
+            cfg["last_dir"] = d
             add_paths([d])
 
+    def on_drop(paths):
+        if not paths:
+            return
+        shown = "\n".join(os.path.basename(p) for p in paths[:12]) + ("\n..." if len(paths) > 12 else "")
+        if messagebox.askyesno("ps2xfer", f"Send to the PS2?\n\n{shown}"):
+            add_paths(paths)
+
+    _win_enable_drop(root, lambda files: ui_q.put(lambda: on_drop(files)))
+
+    # ---- actions on the selection
     def selected():
-        folder = folder_var.get().rstrip("/")
-        return [(n, f"{folder}/{n}") for n in tree.selection()]
+        fold = folder().rstrip("/")
+        return [(n, f"{fold}/{n}") for n in tree.selection()]
 
     def delete():
         sel = selected()
-        if not sel or not messagebox.askyesno("Delete", "Delete on the PS2:\n" + "\n".join(n for n, _ in sel)):
+        if not sel or not messagebox.askyesno("Delete", "Delete on the PS2?\n\n" + "\n".join(n for n, _ in sel)):
             return
 
         def fn():
             for n, pth in sel:
                 conn().call(T_DELETE, Conn.path(pth))
+                sent_map.pop(pth, None)
                 log(f"deleted {pth}")
             list_folder()
+            update_free()
         job("Deleting...", fn)
 
     def rename():
@@ -1909,79 +2428,119 @@ def cmd_gui(args):
             return
         n, pth = sel[0]
         prefix = n[:12] if is_opl_old_name(n) else ""
-        new = simpledialog.askstring("Rename", "New name:", initialvalue=n[len(prefix):])
+        new = simpledialog.askstring("Rename", "New name:", initialvalue=n[len(prefix):], parent=root)
         if not new or new == n[len(prefix):]:
             return
         dst = pth.rsplit("/", 1)[0] + "/" + prefix + new
 
         def fn():
             conn().call(T_RENAME, Conn.path(pth) + Conn.path(dst))
+            if pth in sent_map:
+                sent_map[dst] = sent_map.pop(pth)
             log(f"{pth} -> {dst}")
             list_folder()
         job("Renaming...", fn)
 
     def copy_to_pc():
-        sel = selected()
+        sel = [x for x in selected() if x[0] in {i[0] for i in state["items"] if not i[2] & 0x10}]
         if not sel:
             return
-        d = filedialog.askdirectory(title="Copy to")
+        d = filedialog.askdirectory(title="Copy to", initialdir=cfg.get("last_dir") or None)
         if not d:
             return
 
         def fn():
             for n, pth in sel:
-                st = conn().call(T_STAT, Conn.path(pth))
-                size = struct.unpack_from("<Q", st)[0]
+                st_ = conn().call(T_STAT, Conn.path(pth))
+                size = struct.unpack_from("<Q", st_)[0]
                 local = os.path.join(d, n[12:] if is_opl_old_name(n) else n)
                 with open(local + ".part", "wb") as f:
-                    Downloader(conn(), pth, f.write, size=size, label=f"copy {n}").run()
+                    Downloader(conn(), pth, f.write, size=size, label=f"copy {pth}").run()
                 os.replace(local + ".part", local)
                 log(f"copied {pth} -> {local}")
         job("Copying to the PC...", fn)
+
+    def verify_selected():
+        todo = []
+        for n, pth in selected():
+            src = sent_map.get(pth)
+            if not src or not os.path.isfile(src):
+                src = filedialog.askopenfilename(title=f"The original of {n} on this PC",
+                                                 initialdir=cfg.get("last_dir") or None,
+                                                 filetypes=[("PS2 games", "*.iso *.zso"), ("All files", "*.*")])
+                if not src:
+                    continue
+                sent_map[pth] = src
+            todo.append((n, pth, src))
+
+        def fn():
+            for n, pth, src in todo:
+                verify_file(conn(), src, pth)
+                log(f"{pth}: verify OK")
+                ui(messagebox.showinfo, "Verify", f"{n}\n\nidentical to {src}")
+        if todo:
+            job("Verifying...", fn)
+
+    def art_selected():
+        ids = sorted({n[:11].upper() for n, _ in selected() if is_opl_old_name(n)})
+        if not ids:
+            return
+
+        def fn():
+            have = {n.rsplit(".", 1)[0] for n in ps2_listdir(conn(), "/ART")}
+            for gid in ids:
+                got = art_for_game(conn(), run_args(quiet=True), gid, have)
+                log(f"{gid}: {', '.join(got) if got else 'nothing new'}")
+            list_folder()
+        job("Downloading art...", fn)
 
     def download_art():
         def fn():
             c = conn()
             have = {n.rsplit(".", 1)[0] for n in ps2_listdir(c, "/ART")}
-            for folder in ("/CD", "/DVD"):
-                for n in ps2_listdir(c, folder):
+            for fold in ("/CD", "/DVD"):
+                for n in ps2_listdir(c, fold):
                     _check_cancel()
                     if not n.lower().endswith((".iso", ".zso")):
                         continue
                     gid = n[:11].upper() if is_opl_old_name(n) else (
-                        remote_game_id(c, f"{folder}/{n}") if n.lower().endswith(".iso") else None)
+                        remote_game_id(c, f"{fold}/{n}") if n.lower().endswith(".iso") else None)
                     if gid:
+                        ui(status_var.set, f"Art for {gid}...")
                         got = art_for_game(c, run_args(quiet=True), gid, have)
                         log(f"{gid}: {', '.join(got) if got else 'nothing new'}")
             log("art done")
+            list_folder()
         job("Downloading art...", fn)
 
     def exit_ps2():
-        if messagebox.askyesno("Exit", "Leave ps2xfer on the PS2?"):
-            job("Exit", lambda: (conn().call(T_EXIT), log("PS2 is leaving ps2xfer")))
+        if messagebox.askyesno("Exit", "Leave ps2xfer on the PS2?\n\nAn unfinished transfer resumes next time."):
+            job("Exit", lambda: (conn().call(T_EXIT), log("PS2 is leaving ps2xfer"),
+                                 ui(conn_var.set, "PS2 left ps2xfer"),
+                                 ui(dot.itemconfigure, dot_id, {"fill": "#9ca3af"})))
 
+    # ---- loop
     def pump():
         try:
             while True:
                 ui_q.get_nowait()()
         except queue.Empty:
             pass
-        root.after(100, pump)
+        root.after(80, pump)
 
     def on_close():
-        cfg["verify"] = verify_var.get()
-        cfg["art"] = art_var.get()
-        try:
-            with open(cfg_path, "w") as f:
-                json.dump(cfg, f)
-        except OSError:
-            pass
-        if state["busy"] and not messagebox.askyesno("Quit", "A transfer is running. Quit anyway? "
-                                                     "(an interrupted file resumes next time)"):
+        if state["busy"] and not messagebox.askyesno("Quit", "A transfer is running. Quit anyway?\n\n"
+                                                     "The interrupted file resumes next time."):
             return
+        save_cfg()
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", on_close)
+    folders.selection_set(cfg.get("folder", "/DVD") if cfg.get("folder") in ("/DVD", "/CD", "/ART", "/APPS", "/")
+                          else "/DVD")
+    folders.bind("<<TreeviewSelect>>", lambda e: (cfg.__setitem__("folder", folder()),
+                                                   refresh() if state["conn"] else None))
+    fill_table()
     pump()
     if host_var.get():
         do_connect()

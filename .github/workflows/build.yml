@@ -2,6 +2,8 @@ name: build
 
 on:
   push:
+    branches: ["**"]
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
@@ -52,3 +54,57 @@ jobs:
 
       - name: make test
         run: make test
+
+  windows:
+    name: Windows .exe (PyInstaller)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build ps2xfer-gui.exe (window) and ps2xfer.exe (command line)
+        run: |
+          python -m pip install pyinstaller==6.11.1
+          pyinstaller --onefile --noconsole --name ps2xfer-gui --icon pc/ps2xfer.ico pc/ps2xfer.py
+          pyinstaller --onefile --console --name ps2xfer --icon pc/ps2xfer.ico pc/ps2xfer.py
+
+      - name: Smoke test
+        run: dist\ps2xfer.exe --help
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: ps2xfer-windows
+          path: dist/*.exe
+          if-no-files-found: error
+
+  release:
+    name: GitHub release (tags v*)
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [ps2, windows, host-tests]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+
+      - name: Package
+        run: |
+          set -e
+          mkdir pkg
+          cd pkg
+          unzip -q ../artifacts/ps2xfer/ps2xfer.zip
+          cp ../artifacts/ps2xfer-windows/*.exe ps2xfer/
+          zip -qr "../ps2xfer-${GITHUB_REF_NAME}.zip" ps2xfer
+          ls -la ps2xfer
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "$GITHUB_REF_NAME" "ps2xfer-${GITHUB_REF_NAME}.zip"
+          --repo "$GITHUB_REPOSITORY" --title "ps2xfer $GITHUB_REF_NAME" --generate-notes

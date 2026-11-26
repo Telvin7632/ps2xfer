@@ -55,13 +55,30 @@ run the same `send` again.
 
 ### Window
 
-Double-click `ps2xfer.py` (or `py ps2xfer.py gui`). Enter the PS2's IP (or
-leave it empty to find it by broadcast) and press **Connect**. Then:
-**Add games...** / **Add folder...** send ISO/ZSO files (they go to `CD/` or
-`DVD/`, get OPL names and art automatically), **Delete**, **Rename**,
-**Copy to PC...**, **Download art**, **Exit ps2xfer on the PS2**. The bottom
-shows progress, speed and ETA; **Cancel** stops the current transfer (it
-resumes when the file is sent again). Settings are kept in `~/.ps2xfer.json`.
+On Windows the simplest way is **`ps2xfer-gui.exe`** from the release archive
+(no Python needed); `ps2xfer.exe` is the same program for the command line.
+With Python: double-click `ps2xfer.py` (or `py ps2xfer.py gui`).
+
+Enter the PS2's IP (or leave it empty to find it by broadcast) and press
+**Connect**. The header shows the link, the disk and the free space.
+
+* Left: folders on the PS2 (DVD games, CD games, cover art, apps, all files).
+* Middle: the games with their ID, size, whether a cover is on the PS2 and the
+  date. Click a column to sort, type in **Search** to filter. Right-click,
+  `Del`, `F2` (rename), `F5` (refresh).
+* **+ Add games** / **Add folder**, or **drop .iso files on the window**:
+  they go to `DVD/` or `CD/` with OPL names. **Verify after sending** and
+  **Download cover art** apply to each file as it starts.
+* **Transfers**: the queue with the state of each file (waiting, sending,
+  verifying, cover art, done, failed), the current file's progress, speed and
+  time left, and the whole queue's progress. **Cancel** stops; the file
+  resumes when it is sent again.
+* **Verify** checks files already on the PS2 against the originals on the PC
+  (remembered for files sent from this window, otherwise it asks).
+* Menu **PS2**: cover art for all games, exit ps2xfer on the PS2. **View →
+  Log** shows the details.
+
+Settings are kept in `~/.ps2xfer.json`.
 
 ### Command line
 
