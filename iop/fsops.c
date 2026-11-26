@@ -644,8 +644,23 @@ int fsops_delete(const u8 *req, u32 len)
         return PX_EINVAL;
     if (!g_mounted)
         return PX_ENODISK;
-    if (g_wfile.open && (strcmp(path, g_part_name) == 0 || strcmp(path, g_state_name) == 0))
-        return PX_EBUSY;
+    if (g_wfile.open && (strcmp(path, g_part_name) == 0 || strcmp(path, g_state_name) == 0)) {
+        /* a file of the open transfer: refused while its data still arrives;
+           an interrupted one (silent sender) is closed first. Deleting the
+           .part takes its resume state with it. */
+        if (rxeng_busy())
+            return PX_EBUSY;
+        if (strcmp(path, g_part_name) == 0) {
+            u8 a[3];
+            wr16(a, g_rx.handle);
+            a[2] = 1; /* delete .part and .ps2x */
+            fsops_abort(a, sizeof(a));
+            fsops_update_free();
+            return PX_OK;
+        }
+        close_part(0);
+        g_stats.file[0] = 0;
+    }
     px_fs_lock();
     read_close();
     fr = f_unlink(path);

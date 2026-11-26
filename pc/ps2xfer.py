@@ -2683,7 +2683,12 @@ def cmd_gui(args):
 
         def fn():
             for n, pth in sel:
-                conn().call(T_DELETE, Conn.path(pth))
+                try:
+                    conn().call(T_DELETE, Conn.path(pth))
+                except PxError as e:
+                    if pth.endswith(".ps2x") and "no such file" in str(e):
+                        continue     # went together with its .part
+                    raise
                 sent_map.pop(pth, None)
                 log(f"deleted {pth}")
             list_folder()

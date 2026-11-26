@@ -280,6 +280,22 @@ def main():
         remote["/DVD/busy.iso"] = files["busy.iso"]
         env.kill(signal.SIGTERM)
 
+        print("3c. deleting an interrupted transfer's .part")
+        env.start()
+        files["gone.iso"] = mkfile(os.path.join(d, "gone.iso"), 120 << 20, 14)
+        p = env.popen("send", os.path.join(d, "gone.iso"), "--dest", "/DVD/gone.iso", rate=15)
+        time.sleep(4)
+        out = env.run("rm", "/DVD/gone.iso.part", check=False)
+        assert "busy" in out, out          # data still arriving
+        p.kill()
+        p.wait()
+        time.sleep(3)
+        env.run("rm", "/DVD/gone.iso.part")
+        out = env.run("ls", "/DVD")
+        assert "gone.iso" not in out, out
+        print("    refused while sending, removed with its .ps2x after the sender stopped")
+        env.kill(signal.SIGTERM)
+
         print("4. PS2 'power loss' (simulator killed), then resumed")
         env.start()
         files["pl.iso"] = mkfile(os.path.join(d, "pl.iso"), 120 << 20, 12)
