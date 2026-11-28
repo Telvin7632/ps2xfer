@@ -1,9 +1,12 @@
 /*
  * mcinstall.elf - test helper, run from ps2link:
- *   ps2client execee host:mcinstall.elf <mc dir> <file>... [--run <elf>]
+ *   ps2client execee host:mcinstall.elf <mc dir> <file>... [--icon <file>...] [--run <elf>]
  * Copies each host:<file> to <mc dir>/<file> on the memory card, reads it
  * back and compares, writes the read-back copy to host:<file>.card, and only
  * if every file matches starts <elf> (e.g. the copied ps2link).
+ * Files after --icon (icon.sys and its icon) are copied only if <mc dir> had
+ * no icon.sys: an existing folder keeps its own; a new one is not shown as a
+ * damaged save by the browser. A report goes to host:mcinstall.log.
  * Used to put ps2link on the memory card so ps2xfer's exit_elf can return to it.
  */
 #include <kernel.h>
@@ -75,11 +78,32 @@ static int copy(const char *src, const char *dst)
     return total;
 }
 
+static char report[2048];
+
+static void say(const char *fmt, const char *a, const char *b, int n)
+{
+    char line[640];
+
+    snprintf(line, sizeof(line), fmt, a, b, n);
+    scr_printf("%s", line);
+    strncat(report, line, sizeof(report) - strlen(report) - 1);
+}
+
+static void save_report(void)
+{
+    int fd = open("host:mcinstall.log", O_WRONLY | O_CREAT | O_TRUNC);
+
+    if (fd >= 0) {
+        write(fd, report, strlen(report));
+        close(fd);
+    }
+}
+
 int main(int argc, char *argv[])
 {
     const char *run = NULL;
     char src[256], dst[256], back[256];
-    int i, r, ok = 1;
+    int i, r, ok = 1, icon_part = 0, had_icon;
 
     SifInitRpc(0);
     init_scr();
@@ -93,22 +117,38 @@ int main(int argc, char *argv[])
         scr_printf("  usage: mcinstall <mc dir> <file>... [--run <elf>]\n");
         return 1;
     }
+    snprintf(dst, sizeof(dst), "%s/icon.sys", argv[1]);
+    r = open(dst, O_RDONLY);
+    had_icon = r >= 0;
+    if (r >= 0)
+        close(r);
+    say("  %s: icon.sys %s%d\n", argv[1], had_icon ? "already there " : "missing ", 0);
     mkdir(argv[1], 0777);
     for (i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--run") == 0 && i + 1 < argc) {
             run = argv[++i];
             continue;
         }
+        if (strcmp(argv[i], "--icon") == 0) {
+            icon_part = 1;
+            continue;
+        }
+        if (icon_part && had_icon) {
+            say("  %s: kept the folder's own icon%s%d\n", argv[i], "", 0);
+            continue;
+        }
         snprintf(src, sizeof(src), "host:%s", argv[i]);
         snprintf(dst, sizeof(dst), "%s/%s", argv[1], argv[i]);
         r = copy(src, dst);
-        scr_printf("  %s -> %s: %d\n", src, dst, r);
+        say("  %s -> %s: %d\n", src, dst, r);
         snprintf(back, sizeof(back), "host:%s.card", argv[i]);
         r = (r > 0) ? verify(src, dst, back) : r;
-        scr_printf("    verify: %d\n", r);
+        say("    verify %s%s: %d\n", "", "", r);
         if (r <= 0)
             ok = 0;
     }
+    say("%s%s%d (1 = all files OK)\n", "  result: ", "", ok);
+    save_report();
     if (!ok) {
         scr_printf("\n  FAILED: not starting anything. Reset the console.\n");
         SleepThread();
